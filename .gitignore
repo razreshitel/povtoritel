@@ -1,0 +1,17 @@
+# static ffmpeg binary, fetch with setup.ps1
+bin/
+
+# user state, regenerated with defaults
+config.json
+
+# runtime-generated icons
+icon_rec.ico
+icon_pause.ico
+
+# logs
+*.log
+*.log.old
+
+# python cache
+__pycache__/
+*.pyc
