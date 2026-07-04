@@ -209,6 +209,9 @@ def _guid_eq(a, b):
     return bytes(a) == bytes(b)
 
 
+_keepalive = []
+
+
 def _activate_process_client(pid):
     done = threading.Event()
 
@@ -228,6 +231,7 @@ def _activate_process_client(pid):
     vtbl = _HandlerVtbl(_QI_T(qi), _REF_T(lambda t: 2), _REF_T(lambda t: 1),
                         _DONE_T(completed))
     obj = _HandlerObj(ctypes.pointer(vtbl))
+    _keepalive.append((vtbl, obj))
     params = _ActivationParams(1, _ProcLoopbackParams(pid, 0))
     pv = _PropVariantBlob(VT_BLOB, 0, 0, 0, ctypes.sizeof(params),
                           ctypes.cast(ctypes.byref(params), ctypes.c_void_p))
@@ -259,18 +263,22 @@ class Capture:
         self.client = ctypes.c_void_p()
         self.cap = ctypes.c_void_p()
         self._event = None
-        if process_pid is not None:
-            self._init_process(process_pid)
-        else:
-            self._init_device(loopback, device_id)
-        hr = _vt(self.client, 14, ctypes.c_int32, ctypes.POINTER(GUID),
-                 ctypes.POINTER(ctypes.c_void_p))(
-            self.client, ctypes.byref(IID_CAPTURE), ctypes.byref(self.cap))
-        if hr != 0:
-            raise OSError(f"GetService {hr & 0xFFFFFFFF:#x}")
-        hr = _vt(self.client, 10, ctypes.c_int32)(self.client)
-        if hr != 0:
-            raise OSError(f"Start {hr & 0xFFFFFFFF:#x}")
+        try:
+            if process_pid is not None:
+                self._init_process(process_pid)
+            else:
+                self._init_device(loopback, device_id)
+            hr = _vt(self.client, 14, ctypes.c_int32, ctypes.POINTER(GUID),
+                     ctypes.POINTER(ctypes.c_void_p))(
+                self.client, ctypes.byref(IID_CAPTURE), ctypes.byref(self.cap))
+            if hr != 0:
+                raise OSError(f"GetService {hr & 0xFFFFFFFF:#x}")
+            hr = _vt(self.client, 10, ctypes.c_int32)(self.client)
+            if hr != 0:
+                raise OSError(f"Start {hr & 0xFFFFFFFF:#x}")
+        except Exception:
+            self.close()
+            raise
 
     def _init_process(self, pid):
         self.client = _activate_process_client(pid)

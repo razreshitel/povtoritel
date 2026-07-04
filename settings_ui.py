@@ -135,7 +135,7 @@ class SettingsWin:
                   foreground="#777777").grid(row=9, column=1, columnspan=2,
                                              sticky="w")
 
-        self.priority = tk.BooleanVar(value=bool(cfg.get("capture_priority", True)))
+        self.priority = tk.BooleanVar(value=bool(cfg.get("capture_priority", False)))
         ttk.Checkbutton(frm, text="High capture priority (smoother under GPU load)",
                         variable=self.priority).grid(row=11, column=1,
                                                      columnspan=2, sticky="w",

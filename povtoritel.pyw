@@ -60,6 +60,9 @@ class App:
                 self.toast.show(*self._pending_toast)
         elif kind == "timer":
             self.tray.set_tip(self._tip())
+            if self.recorder.stalled():
+                log.warning("capture stalled, restarting")
+                self.recorder.restart()
             self.ticks += 1
             if self.ticks % 5 == 0:
                 secs, size = self.recorder.buffered()

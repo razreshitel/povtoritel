@@ -58,6 +58,13 @@ def _poke_pipe(name):
         kernel32.CloseHandle(h)
 
 
+def _close_pipe(src):
+    h = src.get("pipe_handle")
+    if h:
+        kernel32.CloseHandle(h)
+        src["pipe_handle"] = None
+
+
 def _peak(data, is_float):
     if is_float:
         arr = array.array("f")
@@ -99,6 +106,7 @@ class Recorder:
         self._fails = 0
         self._warned = set()
         self._pipe_seq = 0
+        self.last_data = time.monotonic()
         self.thread = None
 
     def configure(self, cfg):
@@ -159,6 +167,8 @@ class Recorder:
                 srcs.append({"label": "mic", "title": "Microphone",
                              "kind": "mic", "fmt": fmt,
                              "device": self.mic_device, "thresh": MIC_THRESH})
+        for s in srcs:
+            s["act"] = collections.deque()
         return srcs
 
     def _cmd(self, srcs):
@@ -205,10 +215,8 @@ class Recorder:
         except Exception:
             log.exception("boost failed")
 
-    def _mark(self, label, now):
-        dq = self.activity.get(label)
-        if dq is None:
-            return
+    def _mark(self, src, now):
+        dq = src["act"]
         if not dq or now - dq[-1] > 0.5:
             dq.append(now)
             cut = now - 660
@@ -218,8 +226,10 @@ class Recorder:
     def _sink_for(self, proc, src):
         ok = kernel32.ConnectNamedPipe(src["pipe_handle"], None)
         if not ok and kernel32.GetLastError() != 535:
+            _close_pipe(src)
             raise OSError(f"ConnectNamedPipe {kernel32.GetLastError()}")
         if proc.poll() is not None:
+            _close_pipe(src)
             return None
         fd = msvcrt.open_osfhandle(src["pipe_handle"], 0)
         src["pipe_handle"] = None
@@ -250,16 +260,21 @@ class Recorder:
                     sent += len(data) // block
                     quiet = now
                     if _peak(data, isf) >= src["thresh"]:
-                        self._mark(src["label"], now)
+                        self._mark(src, now)
                 target = int((now - spawn_t) * rate)
                 if target - sent > rate // 20:
                     n = min(target - sent, rate // 2)
                     sink.write(bytes(n * block))
                     sent += n
                 if loopback and now - quiet > 10:
-                    cap.close()
-                    cap = audio.Capture(True, src.get("device") or None)
                     quiet = now
+                    try:
+                        ncap = audio.Capture(True, src.get("device") or None)
+                    except OSError:
+                        pass
+                    else:
+                        cap.close()
+                        cap = ncap
                 time.sleep(0.005)
         except (OSError, ValueError) as e:
             log.warning("%s feed ended: %s", src["label"], e)
@@ -335,7 +350,7 @@ class Recorder:
                     sink.write(data)
                     sent += len(data) // block
                     if _peak(data, True) >= src["thresh"]:
-                        self._mark(src["label"], now)
+                        self._mark(src, now)
                 target = int((now - spawn_t) * rate)
                 if target - sent > rate // 20:
                     n = min(target - sent, rate // 2)
@@ -358,7 +373,7 @@ class Recorder:
                 except (OSError, ValueError):
                     pass
 
-    def _watch_sessions(self, proc, slots):
+    def _watch_sessions(self, proc, slots, names):
         audio.com_init()
         me = os.getpid()
         while proc.poll() is None and not self._stop.is_set():
@@ -396,7 +411,7 @@ class Recorder:
                     root, _exe = winutil.find_audio_root([exe])
                     s["bind"] = {"exe": exe, "pid": root or sess_pid}
                     stem = exe[:-4] if exe.endswith(".exe") else exe
-                    self.slot_names[s["label"]] = stem
+                    names[s["label"]] = stem
                     log.info("%s -> %s", s["label"], exe)
                 else:
                     b = s["bind"]
@@ -428,18 +443,21 @@ class Recorder:
                 except OSError as e:
                     log.warning("pipe for %s failed: %s", s["label"], e)
             srcs = live
+            names = {}
             with self.lock:
                 self.chunks.clear()
                 self.total = 0
                 self.layout = [(s["label"], s["title"]) for s in srcs]
-                self.activity = {s["label"]: collections.deque() for s in srcs}
-                self.slot_names = {}
+                self.activity = {s["label"]: s["act"] for s in srcs}
+                self.slot_names = names
                 self._overflow = set()
             cmd = self._cmd(srcs)
             try:
                 rfd, wfd = _big_pipe(PIPE_SIZE)
             except OSError as e:
                 log.error("pipe failed: %s", e)
+                for s in srcs:
+                    _close_pipe(s)
                 self._stop.wait(10)
                 continue
             try:
@@ -454,6 +472,8 @@ class Recorder:
             except OSError as e:
                 os.close(rfd)
                 os.close(wfd)
+                for s in srcs:
+                    _close_pipe(s)
                 log.error("ffmpeg launch failed: %s", e)
                 self._stop.wait(10)
                 continue
@@ -476,12 +496,13 @@ class Recorder:
             slots = [s for s in srcs if s["kind"] == "slot"]
             if slots:
                 threading.Thread(target=self._watch_sessions,
-                                 args=(proc, slots), daemon=True).start()
+                                 args=(proc, slots, names), daemon=True).start()
             log.info("capture started: adapter=%s output=%s fps=%s quality=%s"
                      " audio=%s app_slots=%s",
                      self.screen.get("adapter"), self.screen.get("output"),
                      self.fps, self.quality, self.audio_on, len(slots))
             started = time.monotonic()
+            self.last_data = started
             while True:
                 try:
                     data = os.read(rfd, READ_SIZE)
@@ -490,6 +511,7 @@ class Recorder:
                 if not data:
                     break
                 now = time.monotonic()
+                self.last_data = now
                 with self.lock:
                     self.chunks.append((now, data))
                     self.total += len(data)
@@ -566,6 +588,11 @@ class Recorder:
             if len(self.chunks) < 2:
                 return 0.0, self.total
             return self.chunks[-1][0] - self.chunks[0][0], self.total
+
+    def stalled(self, limit=150):
+        if self.paused or self.proc is None or self._stop.is_set():
+            return False
+        return time.monotonic() - self.last_data > limit
 
     def save(self, folder):
         with self.lock:
