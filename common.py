@@ -24,8 +24,12 @@ DEFAULTS = {
     "hotkey": {"mods": ["ctrl", "alt"], "vk": 0x52, "label": "Ctrl+Alt+R"},
     "folder": str(Path.home() / "Videos" / "Replays"),
     "audio": True,
+    "mic": False,
+    "mic_device": "",
+    "app_auto": True,
+    "app_slots": 6,
     "audio_offset_ms": 0,
-    "capture_priority": True,
+    "capture_priority": False,
     "autostart": True,
 }
 

@@ -90,6 +90,69 @@ GPU_HIGH = 4
 GPU_REALTIME = 5
 
 
+class PROCESSENTRY32W(ctypes.Structure):
+    _fields_ = [("dwSize", wt.DWORD), ("cntUsage", wt.DWORD),
+                ("th32ProcessID", wt.DWORD), ("th32DefaultHeapID", ctypes.c_size_t),
+                ("th32ModuleID", wt.DWORD), ("cntThreads", wt.DWORD),
+                ("th32ParentProcessID", wt.DWORD), ("pcPriClassBase", ctypes.c_long),
+                ("dwFlags", wt.DWORD), ("szExeFile", ctypes.c_wchar * 260)]
+
+
+kernel32.CreateToolhelp32Snapshot.restype = wt.HANDLE
+kernel32.CreateToolhelp32Snapshot.argtypes = [wt.DWORD, wt.DWORD]
+kernel32.Process32FirstW.argtypes = [wt.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+kernel32.Process32NextW.argtypes = [wt.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+
+
+def list_processes():
+    snap = kernel32.CreateToolhelp32Snapshot(2, 0)
+    procs = []
+    if not snap or snap == wt.HANDLE(-1).value:
+        return procs
+    try:
+        e = PROCESSENTRY32W()
+        e.dwSize = ctypes.sizeof(e)
+        ok = kernel32.Process32FirstW(snap, ctypes.byref(e))
+        while ok:
+            procs.append((e.th32ProcessID, e.th32ParentProcessID,
+                          e.szExeFile.lower()))
+            ok = kernel32.Process32NextW(snap, ctypes.byref(e))
+    finally:
+        kernel32.CloseHandle(snap)
+    return procs
+
+
+def find_audio_root(tokens):
+    procs = list_processes()
+    exe_by_pid = {p: x for p, _pp, x in procs}
+    matches = [(p, pp, x) for p, pp, x in procs
+               if any(t in x for t in tokens)]
+    if not matches:
+        return None, None
+    match_pids = {p for p, _pp, _x in matches}
+    roots = [(p, x) for p, pp, x in matches if pp not in match_pids]
+    if not roots:
+        roots = [(matches[0][0], matches[0][2])]
+    kids = {}
+    for p, pp, _x in matches:
+        kids[pp] = kids.get(pp, 0) + 1
+    roots.sort(key=lambda r: -kids.get(r[0], 0))
+    return roots[0]
+
+
+kernel32.GetExitCodeProcess.argtypes = [wt.HANDLE, ctypes.POINTER(wt.DWORD)]
+
+
+def pid_alive(pid):
+    h = kernel32.OpenProcess(0x1000, False, pid)
+    if not h:
+        return False
+    code = wt.DWORD()
+    kernel32.GetExitCodeProcess(h, ctypes.byref(code))
+    kernel32.CloseHandle(h)
+    return code.value == 259
+
+
 def boost_process(pid, gpu_level=GPU_HIGH, cpu_class=ABOVE_NORMAL_CLASS):
     h = kernel32.OpenProcess(PROCESS_SET_INFORMATION | PROCESS_QUERY_INFORMATION,
                              False, pid)

@@ -3,6 +3,7 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
+import audio
 import common
 import winutil
 
@@ -94,27 +95,64 @@ class SettingsWin:
             row=5, column=2, sticky="w", padx=6)
 
         self.audio = tk.BooleanVar(value=bool(cfg.get("audio", True)))
-        ttk.Checkbutton(frm, text="Record desktop audio",
-                        variable=self.audio).grid(row=6, column=1,
+        ttk.Checkbutton(frm, text="Record desktop audio (full mix track)",
+                        variable=self.audio).grid(row=6, column=1, columnspan=2,
                                                   sticky="w", pady=(8, 0))
+
+        ttk.Label(frm, text="Microphone:").grid(row=7, column=0, sticky="w",
+                                                padx=(0, 10), pady=4)
+        self.mic = tk.BooleanVar(value=bool(cfg.get("mic", False)))
+        ttk.Checkbutton(frm, text="Record", variable=self.mic).grid(
+            row=7, column=1, sticky="w")
+        try:
+            self.mics = audio.list_mics()
+        except Exception:
+            self.mics = []
+        mic_names = ["Default microphone"] + [m["name"] for m in self.mics]
+        cur_id = cfg.get("mic_device", "")
+        sel = 0
+        if cur_id:
+            ids = [m["id"] for m in self.mics]
+            if cur_id in ids:
+                sel = ids.index(cur_id) + 1
+            else:
+                self.mics.append({"id": cur_id, "name": "Saved device (offline)"})
+                mic_names.append("Saved device (offline)")
+                sel = len(mic_names) - 1
+        self.mic_box = ttk.Combobox(frm, values=mic_names, state="readonly",
+                                    width=30)
+        self.mic_box.current(sel)
+        self.mic_box.grid(row=7, column=2, sticky="w", padx=6, pady=4)
+
+        self.app_auto = tk.BooleanVar(value=bool(cfg.get("app_auto", True)))
+        ttk.Checkbutton(frm, text="Per-app audio tracks (automatic, like"
+                                  " Volume Mixer)",
+                        variable=self.app_auto).grid(row=8, column=1,
+                                                     columnspan=2, sticky="w",
+                                                     pady=(2, 0))
+        ttk.Label(frm, text="Every app that plays sound gets its own track"
+                            " named after its exe. Silent ones are dropped.",
+                  foreground="#777777").grid(row=9, column=1, columnspan=2,
+                                             sticky="w")
 
         self.priority = tk.BooleanVar(value=bool(cfg.get("capture_priority", True)))
         ttk.Checkbutton(frm, text="High capture priority (smoother under GPU load)",
-                        variable=self.priority).grid(row=7, column=1,
-                                                     columnspan=2, sticky="w")
+                        variable=self.priority).grid(row=11, column=1,
+                                                     columnspan=2, sticky="w",
+                                                     pady=(6, 0))
 
         self.autostart = tk.BooleanVar(value=bool(cfg["autostart"]))
         ttk.Checkbutton(frm, text="Start with Windows",
-                        variable=self.autostart).grid(row=8, column=1,
+                        variable=self.autostart).grid(row=12, column=1,
                                                       sticky="w", pady=(0, 2))
 
-        ttk.Label(frm, text="Changes apply live. Capture restarts if screen,"
-                            " FPS, quality or audio change.",
-                  foreground="#777777").grid(row=9, column=0, columnspan=3,
+        ttk.Label(frm, text="Changes apply live. Silent tracks are dropped"
+                            " from saved files automatically.",
+                  foreground="#777777").grid(row=13, column=0, columnspan=3,
                                              sticky="w", pady=(8, 2))
 
         btns = ttk.Frame(frm)
-        btns.grid(row=10, column=0, columnspan=3, sticky="e", pady=(10, 0))
+        btns.grid(row=14, column=0, columnspan=3, sticky="e", pady=(10, 0))
         ttk.Button(btns, text="Save", command=self._save).pack(side="left", padx=4)
         ttk.Button(btns, text="Cancel", command=root.destroy).pack(side="left")
 
@@ -187,6 +225,10 @@ class SettingsWin:
         self.cfg["hotkey"] = dict(self.hotkey)
         self.cfg["folder"] = folder
         self.cfg["audio"] = bool(self.audio.get())
+        self.cfg["mic"] = bool(self.mic.get())
+        idx = self.mic_box.current()
+        self.cfg["mic_device"] = "" if idx <= 0 else self.mics[idx - 1]["id"]
+        self.cfg["app_auto"] = bool(self.app_auto.get())
         self.cfg["capture_priority"] = bool(self.priority.get())
         self.cfg["autostart"] = bool(self.autostart.get())
         common.save_cfg(self.cfg)

@@ -169,8 +169,16 @@ def run_app():
     common.setup_logging()
     winutil.set_dpi_aware()
     winutil.kernel32.SetErrorMode(0x8003)
-    if not winutil.single_instance("Local\\PovtoritelMutex"):
-        winutil.post_to_running(winutil.MSG_SETTINGS)
+    import time
+    got = False
+    for _ in range(10):
+        if winutil.single_instance("Local\\PovtoritelMutex"):
+            got = True
+            break
+        if winutil.post_to_running(winutil.MSG_SETTINGS):
+            return
+        time.sleep(0.5)
+    if not got:
         return
     common.rotate(common.FF_LOG)
     for path, color in ((common.ICON_REC, (224, 48, 48)),

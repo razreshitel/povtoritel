@@ -23,14 +23,29 @@ pythonw povtoritel.pyw
   (`h264_nvenc`) on the RTX 3080. If the picked screen ever hangs off the
   AMD iGPU instead, the app switches to that adapter automatically
   (`h264_amf`), still zero-copy.
-- When "High capture priority" is on (default), the app raises the ffmpeg
-  process to GPU scheduling class High
-  (`D3DKMTSetProcessSchedulingPriorityClass`) and CPU class AboveNormal so
-  the desktop-capture copies get serviced ahead of the game under 100% GPU
-  load. This is the same idea OBS uses. It costs the game a little.
-- Desktop audio is captured with WASAPI loopback (whatever the default
-  output device plays), fed to the same ffmpeg as raw PCM and encoded to
-  AAC 160k. Silence is filled in when nothing plays so sync never drifts.
+- ffmpeg is always stopped gracefully (a `q` on its stdin command channel,
+  kill only as a 3s-timeout fallback) so NVENC/D3D11 contexts release
+  cleanly and a loaded GPU is never poked by a hard TerminateProcess.
+- "High capture priority" (off by default) raises the ffmpeg process to GPU
+  scheduling class High (`D3DKMTSetProcessSchedulingPriorityClass`) and CPU
+  AboveNormal, like OBS does. Measured benefit after the MPO fix was small,
+  and preempting a fully loaded GPU is a stability risk on this machine, so
+  leave it off unless captures stutter again.
+- Audio goes into SEPARATE tracks in the mp4 (for DaVinci Resolve etc),
+  Volume-Mixer style and fully automatic: a session watcher polls
+  IAudioSessionManager2 like the Windows mixer does, and every app that
+  starts playing sound gets its own per-process loopback capture and its
+  own AAC track named after its exe. Plus a Desktop track (full mix) and
+  an optional Microphone track (device selectable). Everything is fed to
+  ffmpeg as raw PCM over named pipes, silence-filled so sync never drifts.
+- On save, tracks that made no sound inside the saved window are dropped
+  automatically, so the file contains exactly the apps you actually heard.
+- Implementation detail: ffmpeg inputs are fixed at spawn, so the app keeps
+  a pool of `app_slots` generic tracks (default 6, config.json) and the
+  watcher assigns apps to free slots as they start playing (one slot per
+  exe for the whole capture run; apps beyond the pool stay in the Desktop
+  mix, logged). stdin is reserved as ffmpeg's command channel for graceful
+  shutdown.
 - The encoded MPEG-TS stream is piped into the Python process (32 MB pipe,
   high-priority reader, CFR timestamps, so the encoder never stalls and
   frame pacing stays even) and kept in a RAM deque trimmed to the
@@ -49,10 +64,11 @@ pythonw povtoritel.pyw
   - Left or right click: menu (Save replay now, Pause, Open folder,
     Settings, Start with Windows, Quit).
   - Double click: Settings.
-- Settings window: screen picker, buffer length 1-10 min, 30/60 fps,
-  quality (Low/Medium/High bitrate caps), hotkey, save folder, desktop
-  audio on/off, autostart. Changes apply live; capture restarts when
-  screen/fps/quality/audio change.
+- Settings window: screen picker, buffer length 1-10 min, 30/60/120/144
+  fps, quality (Low/Medium/High bitrate caps), hotkey, save folder,
+  desktop audio on/off, microphone on/off with device picker, automatic
+  per-app tracks on/off, capture priority, autostart. Changes apply live;
+  capture restarts when capture-affecting settings change.
 
 ### Hotkey rules
 

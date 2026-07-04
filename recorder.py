@@ -1,3 +1,4 @@
+import array
 import collections
 import ctypes
 import ctypes.wintypes as wt
@@ -22,16 +23,49 @@ SAVE_PAD = 3
 HARD_CAP = 3 * 1024 ** 3
 PIPE_SIZE = 32 * 1024 * 1024
 READ_SIZE = 262144
+DEV_THRESH = 1e-4
+MIC_THRESH = 0.003
+
+kernel32 = ctypes.windll.kernel32
+kernel32.CreateNamedPipeW.restype = wt.HANDLE
+kernel32.CreateNamedPipeW.argtypes = [wt.LPCWSTR, wt.DWORD, wt.DWORD, wt.DWORD,
+                                      wt.DWORD, wt.DWORD, wt.DWORD, wt.LPVOID]
+kernel32.ConnectNamedPipe.argtypes = [wt.HANDLE, wt.LPVOID]
+kernel32.CreateFileW.restype = wt.HANDLE
+kernel32.CreateFileW.argtypes = [wt.LPCWSTR, wt.DWORD, wt.DWORD, wt.LPVOID,
+                                 wt.DWORD, wt.DWORD, wt.HANDLE]
 
 
 def _big_pipe(size):
     rh, wh = wt.HANDLE(), wt.HANDLE()
-    if not ctypes.windll.kernel32.CreatePipe(ctypes.byref(rh), ctypes.byref(wh),
-                                             None, size):
+    if not kernel32.CreatePipe(ctypes.byref(rh), ctypes.byref(wh), None, size):
         raise OSError("CreatePipe failed")
     rfd = msvcrt.open_osfhandle(rh.value, os.O_RDONLY | os.O_BINARY)
     wfd = msvcrt.open_osfhandle(wh.value, 0)
     return rfd, wfd
+
+
+def _named_pipe(name):
+    h = kernel32.CreateNamedPipeW(name, 2, 0, 1, 4 * 1024 * 1024, 0, 0, None)
+    if not h or h == wt.HANDLE(-1).value:
+        raise OSError("CreateNamedPipe failed")
+    return h
+
+
+def _poke_pipe(name):
+    h = kernel32.CreateFileW(name, 0x80000000, 0, None, 3, 0, None)
+    if h and h != wt.HANDLE(-1).value:
+        kernel32.CloseHandle(h)
+
+
+def _peak(data, is_float):
+    if is_float:
+        arr = array.array("f")
+        arr.frombytes(data)
+        return max(map(abs, arr[::16]), default=0.0)
+    arr = array.array("h")
+    arr.frombytes(data[: len(data) // 2 * 2])
+    return max(map(abs, arr[::16]), default=0) / 32768.0
 
 
 class Recorder:
@@ -46,8 +80,16 @@ class Recorder:
         self.fps = 30
         self.quality = "medium"
         self.audio_on = True
-        self.priority = True
+        self.mic_on = False
+        self.mic_device = ""
+        self.app_auto = True
+        self.app_slots = 6
+        self.priority = False
         self.offset_ms = 0
+        self.layout = []
+        self.activity = {}
+        self.slot_names = {}
+        self._overflow = set()
         self.proc = None
         self.paused = False
         self.fail_cb = None
@@ -55,7 +97,8 @@ class Recorder:
         self._wake = threading.Event()
         self._restart = False
         self._fails = 0
-        self._audio_warned = False
+        self._warned = set()
+        self._pipe_seq = 0
         self.thread = None
 
     def configure(self, cfg):
@@ -63,33 +106,62 @@ class Recorder:
                    or int(cfg["fps"]) != self.fps
                    or cfg["quality"] != self.quality
                    or bool(cfg.get("audio", True)) != self.audio_on
-                   or bool(cfg.get("capture_priority", True)) != self.priority
+                   or bool(cfg.get("mic", False)) != self.mic_on
+                   or cfg.get("mic_device", "") != self.mic_device
+                   or bool(cfg.get("app_auto", True)) != self.app_auto
+                   or int(cfg.get("app_slots", 6)) != self.app_slots
+                   or bool(cfg.get("capture_priority", False)) != self.priority
                    or int(cfg.get("audio_offset_ms", 0)) != self.offset_ms)
         self.screen = dict(cfg["screen"])
         self.fps = int(cfg["fps"])
         self.quality = cfg["quality"]
         self.minutes = max(1, min(10, int(cfg["minutes"])))
         self.audio_on = bool(cfg.get("audio", True))
-        self.priority = bool(cfg.get("capture_priority", True))
+        self.mic_on = bool(cfg.get("mic", False))
+        self.mic_device = cfg.get("mic_device", "")
+        self.app_auto = bool(cfg.get("app_auto", True))
+        self.app_slots = max(1, min(10, int(cfg.get("app_slots", 6))))
+        self.priority = bool(cfg.get("capture_priority", False))
         self.offset_ms = int(cfg.get("audio_offset_ms", 0))
         if restart and self.thread and not self.paused:
             self.restart()
 
-    def _probe_audio(self):
+    def _probe(self, loopback, device, label):
         try:
             audio.com_init()
-            lb = audio.Loopback()
-            fmt = (lb.rate, lb.channels, lb.is_float)
-            lb.close()
-            self._audio_warned = False
+            c = audio.Capture(loopback, device or None)
+            fmt = (c.rate, c.channels, c.is_float)
+            c.close()
+            self._warned.discard(label)
             return fmt
         except Exception as e:
-            if not self._audio_warned:
-                self._audio_warned = True
-                log.warning("desktop audio unavailable: %s", e)
+            if label not in self._warned:
+                self._warned.add(label)
+                log.warning("%s audio unavailable: %s", label, e)
             return None
 
-    def _cmd(self, afmt):
+    def _plan(self):
+        srcs = []
+        if self.audio_on:
+            fmt = self._probe(True, None, "desktop")
+            if fmt:
+                srcs.append({"label": "desktop", "title": "Desktop",
+                             "kind": "loopback", "fmt": fmt,
+                             "device": "", "thresh": DEV_THRESH})
+        if self.app_auto:
+            for i in range(self.app_slots):
+                srcs.append({"label": f"slot{i}", "title": "App",
+                             "kind": "slot", "fmt": (48000, 2, True),
+                             "thresh": DEV_THRESH, "bind": None})
+        if self.mic_on:
+            fmt = self._probe(False, self.mic_device, "microphone")
+            if fmt:
+                srcs.append({"label": "mic", "title": "Microphone",
+                             "kind": "mic", "fmt": fmt,
+                             "device": self.mic_device, "thresh": MIC_THRESH})
+        return srcs
+
+    def _cmd(self, srcs):
         cq, mbit = QUALITY.get(self.quality, QUALITY["medium"])
         a = int(self.screen.get("adapter", 0))
         o = int(self.screen.get("output", 0))
@@ -107,15 +179,17 @@ class Recorder:
         cmd = [self.ffmpeg, "-hide_banner", "-loglevel", "warning", "-y",
                "-init_hw_device", f"d3d11va=gpu:{a}", "-filter_hw_device", "gpu",
                "-filter_complex", grab]
-        if afmt:
-            rate, ch, is_float = afmt
+        maps = []
+        for idx, s in enumerate(srcs):
+            rate, ch, is_float = s["fmt"]
             if self.offset_ms:
                 cmd += ["-itsoffset", str(self.offset_ms / 1000)]
-            cmd += ["-f", "f32le" if is_float else "s16le",
-                    "-ar", str(rate), "-ac", str(ch), "-i", "pipe:0"]
+            cmd += ["-f", "f32le" if is_float else "s16le", "-ar", str(rate),
+                    "-ac", str(ch), "-i", s["pipe_name"]]
+            maps += ["-map", f"{idx}:a"]
         cmd += enc
-        if afmt:
-            cmd += ["-c:a", "aac", "-b:a", "160k", "-map", "0:a"]
+        if srcs:
+            cmd += ["-c:a", "aac", "-b:a", "160k"] + maps
         cmd += ["-g", str(self.fps), "-r", str(self.fps), "-fps_mode", "cfr",
                 "-f", "mpegts", "pipe:1"]
         return cmd
@@ -124,55 +198,217 @@ class Recorder:
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
 
-    def _audio_feed(self, proc, spawn_t):
+    def _boost(self, pid):
+        try:
+            ok = winutil.boost_process(pid)
+            log.info("capture priority boost: %s", "ok" if ok else "failed")
+        except Exception:
+            log.exception("boost failed")
+
+    def _mark(self, label, now):
+        dq = self.activity.get(label)
+        if dq is None:
+            return
+        if not dq or now - dq[-1] > 0.5:
+            dq.append(now)
+            cut = now - 660
+            while dq and dq[0] < cut:
+                dq.popleft()
+
+    def _sink_for(self, proc, src):
+        ok = kernel32.ConnectNamedPipe(src["pipe_handle"], None)
+        if not ok and kernel32.GetLastError() != 535:
+            raise OSError(f"ConnectNamedPipe {kernel32.GetLastError()}")
+        if proc.poll() is not None:
+            return None
+        fd = msvcrt.open_osfhandle(src["pipe_handle"], 0)
+        src["pipe_handle"] = None
+        return os.fdopen(fd, "wb", 0)
+
+    def _feed_dev(self, proc, spawn_t, src):
         audio.com_init()
         cap = None
-        stdin = proc.stdin
+        sink = None
+        loopback = src["kind"] == "loopback"
         try:
-            cap = audio.Loopback()
-            rate, block = cap.rate, cap.block
+            sink = self._sink_for(proc, src)
+            if sink is None:
+                return
+            cap = audio.Capture(loopback, src.get("device") or None)
+            rate, block, isf = cap.rate, cap.block, cap.is_float
             lead = int((time.monotonic() - spawn_t) * rate)
             sent = 0
             if 0 < lead < rate * 3:
-                stdin.write(bytes(lead * block))
+                sink.write(bytes(lead * block))
                 sent = lead
             quiet = time.monotonic()
             while proc.poll() is None and not self._stop.is_set():
                 data = cap.read()
                 now = time.monotonic()
                 if data:
-                    stdin.write(data)
+                    sink.write(data)
                     sent += len(data) // block
                     quiet = now
+                    if _peak(data, isf) >= src["thresh"]:
+                        self._mark(src["label"], now)
                 target = int((now - spawn_t) * rate)
                 if target - sent > rate // 20:
                     n = min(target - sent, rate // 2)
-                    stdin.write(bytes(n * block))
+                    sink.write(bytes(n * block))
                     sent += n
-                if now - quiet > 10:
+                if loopback and now - quiet > 10:
                     cap.close()
-                    cap = audio.Loopback()
+                    cap = audio.Capture(True, src.get("device") or None)
                     quiet = now
                 time.sleep(0.005)
         except (OSError, ValueError) as e:
-            log.warning("audio feed ended: %s", e)
+            log.warning("%s feed ended: %s", src["label"], e)
         except Exception:
-            log.exception("audio feed failed")
+            log.exception("%s feed failed", src["label"])
         finally:
             if cap:
                 try:
                     cap.close()
                 except Exception:
                     pass
+            if sink:
+                try:
+                    sink.close()
+                except (OSError, ValueError):
+                    pass
+
+    def _feed_slot(self, proc, spawn_t, src):
+        audio.com_init()
+        cap = None
+        sink = None
+        pid = None
+        rate, block = 48000, 8
+        try:
+            sink = self._sink_for(proc, src)
+            if sink is None:
+                return
+            lead = int((time.monotonic() - spawn_t) * rate)
+            sent = 0
+            if 0 < lead < rate * 3:
+                sink.write(bytes(lead * block))
+                sent = lead
+            next_check = 0.0
+            while proc.poll() is None and not self._stop.is_set():
+                now = time.monotonic()
+                bind = src.get("bind")
+                want = bind.get("pid") if bind else None
+                if cap is None and want:
+                    try:
+                        cap = audio.Capture(process_pid=want)
+                        pid = want
+                        next_check = now + 5
+                        log.info("track '%s' attached: pid=%s",
+                                 bind.get("exe"), want)
+                    except OSError as e:
+                        bind["pid"] = None
+                        key = "attach_" + str(want)
+                        if key not in self._warned:
+                            self._warned.add(key)
+                            log.warning("track '%s' attach failed: %s",
+                                        bind.get("exe"), e)
+                data = b""
+                if cap:
+                    try:
+                        data = cap.read()
+                    except OSError:
+                        data = b""
+                        cap.close()
+                        cap = None
+                        if bind:
+                            bind["pid"] = None
+                        log.info("track slot detached (pid %s)", pid)
+                    if cap and now >= next_check:
+                        next_check = now + 5
+                        if not winutil.pid_alive(pid):
+                            cap.close()
+                            cap = None
+                            if bind:
+                                bind["pid"] = None
+                            log.info("track '%s' target exited",
+                                     bind.get("exe") if bind else "?")
+                if data:
+                    sink.write(data)
+                    sent += len(data) // block
+                    if _peak(data, True) >= src["thresh"]:
+                        self._mark(src["label"], now)
+                target = int((now - spawn_t) * rate)
+                if target - sent > rate // 20:
+                    n = min(target - sent, rate // 2)
+                    sink.write(bytes(n * block))
+                    sent += n
+                time.sleep(0.005)
+        except (OSError, ValueError) as e:
+            log.warning("%s feed ended: %s", src["label"], e)
+        except Exception:
+            log.exception("%s feed failed", src["label"])
+        finally:
+            if cap:
+                try:
+                    cap.close()
+                except Exception:
+                    pass
+            if sink:
+                try:
+                    sink.close()
+                except (OSError, ValueError):
+                    pass
+
+    def _watch_sessions(self, proc, slots):
+        audio.com_init()
+        me = os.getpid()
+        while proc.poll() is None and not self._stop.is_set():
             try:
-                stdin.close()
-            except (OSError, ValueError):
-                pass
+                sessions = audio.list_audio_sessions()
+                procs = winutil.list_processes()
+            except Exception:
+                if self._stop.wait(3):
+                    return
+                continue
+            exe_by_pid = {p: x for p, _pp, x in procs}
+            active = {}
+            for pid, state, is_sys in sessions:
+                if is_sys or state != 1 or pid in (0, 4, me):
+                    continue
+                exe = exe_by_pid.get(pid)
+                if not exe or exe in ("audiodg.exe", "ffmpeg.exe"):
+                    continue
+                active.setdefault(exe, pid)
+            by_exe = {}
+            for s in slots:
+                b = s.get("bind")
+                if b:
+                    by_exe[b["exe"]] = s
+            for exe, sess_pid in active.items():
+                s = by_exe.get(exe)
+                if s is None:
+                    s = next((x for x in slots if not x.get("bind")), None)
+                    if s is None:
+                        if exe not in self._overflow:
+                            self._overflow.add(exe)
+                            log.warning("no free track slot for %s"
+                                        " (audio stays in Desktop mix)", exe)
+                        continue
+                    root, _exe = winutil.find_audio_root([exe])
+                    s["bind"] = {"exe": exe, "pid": root or sess_pid}
+                    stem = exe[:-4] if exe.endswith(".exe") else exe
+                    self.slot_names[s["label"]] = stem
+                    log.info("%s -> %s", s["label"], exe)
+                else:
+                    b = s["bind"]
+                    if not b.get("pid"):
+                        root, _exe = winutil.find_audio_root([exe])
+                        b["pid"] = root or sess_pid
+            if self._stop.wait(1.5):
+                return
 
     def _run(self):
         try:
-            k = ctypes.windll.kernel32
-            k.SetThreadPriority(k.GetCurrentThread(), 2)
+            kernel32.SetThreadPriority(kernel32.GetCurrentThread(), 2)
         except Exception:
             pass
         while not self._stop.is_set():
@@ -180,11 +416,26 @@ class Recorder:
                 self._wake.wait()
                 self._wake.clear()
                 continue
+            srcs = self._plan()
+            live = []
+            for s in srcs:
+                self._pipe_seq += 1
+                s["pipe_name"] = (rf"\\.\pipe\povtoritel_{s['label']}_"
+                                  rf"{os.getpid()}_{self._pipe_seq}")
+                try:
+                    s["pipe_handle"] = _named_pipe(s["pipe_name"])
+                    live.append(s)
+                except OSError as e:
+                    log.warning("pipe for %s failed: %s", s["label"], e)
+            srcs = live
             with self.lock:
                 self.chunks.clear()
                 self.total = 0
-            afmt = self._probe_audio() if self.audio_on else None
-            cmd = self._cmd(afmt)
+                self.layout = [(s["label"], s["title"]) for s in srcs]
+                self.activity = {s["label"]: collections.deque() for s in srcs}
+                self.slot_names = {}
+                self._overflow = set()
+            cmd = self._cmd(srcs)
             try:
                 rfd, wfd = _big_pipe(PIPE_SIZE)
             except OSError as e:
@@ -198,8 +449,7 @@ class Recorder:
             spawn_t = time.monotonic()
             try:
                 proc = subprocess.Popen(
-                    cmd, stdout=wfd,
-                    stdin=subprocess.PIPE if afmt else subprocess.DEVNULL,
+                    cmd, stdout=wfd, stdin=subprocess.PIPE,
                     stderr=errf, bufsize=0, creationflags=CREATE_NO_WINDOW)
             except OSError as e:
                 os.close(rfd)
@@ -216,15 +466,21 @@ class Recorder:
             if self.priority:
                 threading.Thread(target=self._boost, args=(proc.pid,),
                                  daemon=True).start()
-            feeder = None
-            if afmt:
-                feeder = threading.Thread(target=self._audio_feed,
-                                          args=(proc, spawn_t), daemon=True)
-                feeder.start()
+            feeders = []
+            for s in srcs:
+                fn = self._feed_slot if s["kind"] == "slot" else self._feed_dev
+                th = threading.Thread(target=fn, args=(proc, spawn_t, s),
+                                      daemon=True)
+                th.start()
+                feeders.append(th)
+            slots = [s for s in srcs if s["kind"] == "slot"]
+            if slots:
+                threading.Thread(target=self._watch_sessions,
+                                 args=(proc, slots), daemon=True).start()
             log.info("capture started: adapter=%s output=%s fps=%s quality=%s"
-                     " audio=%s", self.screen.get("adapter"),
-                     self.screen.get("output"), self.fps, self.quality,
-                     bool(afmt))
+                     " audio=%s app_slots=%s",
+                     self.screen.get("adapter"), self.screen.get("output"),
+                     self.fps, self.quality, self.audio_on, len(slots))
             started = time.monotonic()
             while True:
                 try:
@@ -245,8 +501,10 @@ class Recorder:
             os.close(rfd)
             rc = proc.wait()
             self.proc = None
-            if feeder:
-                feeder.join(2)
+            for s in srcs:
+                _poke_pipe(s["pipe_name"])
+            for th in feeders:
+                th.join(2)
             if self._stop.is_set() or self.paused or self._restart:
                 continue
             alive = time.monotonic() - started
@@ -264,20 +522,24 @@ class Recorder:
                 continue
             self._stop.wait(wait)
 
-    def _boost(self, pid):
-        try:
-            ok = winutil.boost_process(pid)
-            log.info("capture priority boost: %s", "ok" if ok else "failed")
-        except Exception:
-            log.exception("boost failed")
-
     def _kill(self):
         p = self.proc
-        if p:
-            try:
-                p.kill()
-            except OSError:
-                pass
+        if not p:
+            return
+        try:
+            p.stdin.write(b"q\n")
+            p.stdin.flush()
+        except (OSError, ValueError, AttributeError):
+            pass
+        try:
+            p.wait(3)
+            return
+        except subprocess.TimeoutExpired:
+            log.warning("graceful quit timed out, killing")
+        try:
+            p.kill()
+        except OSError:
+            pass
 
     def restart(self):
         self._restart = True
@@ -308,11 +570,30 @@ class Recorder:
     def save(self, folder):
         with self.lock:
             snap = list(self.chunks)
+            layout = list(self.layout)
+            names = dict(self.slot_names)
+            last_act = {k: (dq[-1] if dq else None)
+                        for k, dq in self.activity.items()}
         if len(snap) < 2:
             raise RuntimeError("nothing buffered yet")
         cut = snap[-1][0] - (self.minutes * 60 + SAVE_PAD)
         snap = [c for c in snap if c[0] >= cut]
         dur = snap[-1][0] - snap[0][0]
+        maps = ["-map", "0:v:0"]
+        meta = []
+        kept = []
+        out_a = 0
+        for i, (label, title) in enumerate(layout):
+            title = names.get(label, title)
+            last = last_act.get(label)
+            if last is not None and last >= cut - 2:
+                maps += ["-map", f"0:a:{i}?"]
+                meta += [f"-metadata:s:a:{out_a}", f"handler_name={title}",
+                         f"-metadata:s:a:{out_a}", f"title={title}"]
+                kept.append(title)
+                out_a += 1
+        log.info("saving tracks: %s (of %s)", kept or "none",
+                 [t for _l, t in layout])
         folder = Path(folder)
         folder.mkdir(parents=True, exist_ok=True)
         name = "replay_" + datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S") + ".mp4"
@@ -320,8 +601,8 @@ class Recorder:
         with open(self.err_log, "ab") as errf:
             proc = subprocess.Popen(
                 [self.ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
-                 "-f", "mpegts", "-i", "pipe:0", "-c", "copy",
-                 "-movflags", "+faststart", str(out)],
+                 "-f", "mpegts", "-i", "pipe:0"] + maps +
+                ["-c", "copy"] + meta + ["-movflags", "+faststart", str(out)],
                 stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=errf,
                 creationflags=CREATE_NO_WINDOW)
             try:
