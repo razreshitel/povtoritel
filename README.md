@@ -78,6 +78,11 @@ registers, `Shift+Alt+X` does. The first regular key ends the capture, so
 things like `M+N` are impossible. A bare key (`F9`) is also allowed.
 Esc cancels.
 
+Extra held modifiers are tolerated: with the hotkey set to `F11`, pressing
+it while holding Shift or Ctrl (sprinting or crouching in a game) still
+saves. The app registers every modifier superset of the combo; supersets
+already taken by other apps are skipped and logged.
+
 ## CLI
 
 ```
@@ -128,6 +133,9 @@ app) uses a private NVIDIA capture path and will beat any DDA tool here.
 - The RAM buffer is cleared whenever capture restarts: settings change,
   pause then resume, screen lock or sleep. Pause alone keeps the buffer,
   so Pause then Save still works.
+- While the desktop is unavailable (lock screen, display sleep) capture
+  fails and retries with backoff, up to once a minute, forever. It resumes
+  by itself once the desktop is back; no manual Resume needed.
 - RAM use scales with content: static desktop is tiny, busy gameplay tops
   out around bitrate cap x window (Medium, 5 min: about 550 MB worst case).
 - Autostart is an HKCU Run registry entry named `Povtoritel`. Remove with

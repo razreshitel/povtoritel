@@ -221,6 +221,15 @@ def set_dpi_aware():
             pass
 
 
+def desktop_locked():
+    user32.OpenInputDesktop.restype = wt.HANDLE
+    h = user32.OpenInputDesktop(0, False, 0x0100)
+    if h:
+        user32.CloseDesktop(h)
+        return False
+    return True
+
+
 def error_box(title, text):
     user32.MessageBoxW(None, text, title, 0x10)
 
@@ -434,11 +443,31 @@ class Tray:
         return cmd
 
     def register_hotkey(self, mods, vk):
-        user32.UnregisterHotKey(self.hwnd, HOTKEY_ID)
-        val = MOD_NOREPEAT
+        for hid in getattr(self, "_hk_ids", []):
+            user32.UnregisterHotKey(self.hwnd, hid)
+        self._hk_ids = []
+        base = 0
         for m in mods:
-            val |= MODS.get(m, 0)
-        return bool(user32.RegisterHotKey(self.hwnd, HOTKEY_ID, val, vk))
+            base |= MODS.get(m, 0)
+        extras = [v for v in MODS.values() if not base & v]
+        ok = False
+        hid = HOTKEY_ID
+        # extra held modifiers tolerated
+        for n in range(1 << len(extras)):
+            val = base
+            for i, ev in enumerate(extras):
+                if n & (1 << i):
+                    val |= ev
+            if user32.RegisterHotKey(self.hwnd, hid, val | MOD_NOREPEAT, vk):
+                self._hk_ids.append(hid)
+                if n == 0:
+                    ok = True
+            elif n == 0:
+                log.warning("hotkey register failed vk=%#x mods=%#x", vk, val)
+            else:
+                log.info("hotkey combo taken elsewhere, mods=%#x", val)
+            hid += 1
+        return ok
 
     def start_timer(self, ms):
         user32.SetTimer(self.hwnd, 1, ms, None)
@@ -491,7 +520,8 @@ class Tray:
             user32.DispatchMessageW(ctypes.byref(msg))
 
     def destroy(self):
-        user32.UnregisterHotKey(self.hwnd, HOTKEY_ID)
+        for hid in getattr(self, "_hk_ids", [HOTKEY_ID]):
+            user32.UnregisterHotKey(self.hwnd, hid)
         shell32.Shell_NotifyIconW(NIM_DELETE, ctypes.byref(self._nid))
         user32.DestroyWindow(self.hwnd)
 

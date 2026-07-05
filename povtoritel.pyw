@@ -153,15 +153,15 @@ class App:
 
     def _capture_failing(self, fails):
         if fails >= 8:
-            self.tray.set_icon(common.ICON_PAUSE)
-            self.tray.balloon("Buffering paused",
-                              "Capture failed repeatedly, so buffering was"
-                              " paused. Fix Settings, then Resume from the"
-                              " tray menu (see ffmpeg.log).")
+            self.tray.balloon("Capture failing",
+                              "Screen capture keeps failing; retrying every"
+                              " minute. It resumes by itself once the screen"
+                              " is available (see ffmpeg.log).")
         else:
             self.tray.balloon("Capture failing",
-                              "Screen capture keeps failing. Re-pick the"
-                              " screen in Settings (see ffmpeg.log).")
+                              "Screen capture keeps failing. If this persists,"
+                              " re-pick the screen in Settings"
+                              " (see ffmpeg.log).")
 
     def quit(self):
         self.recorder.stop()

@@ -530,18 +530,15 @@ class Recorder:
             if self._stop.is_set() or self.paused or self._restart:
                 continue
             alive = time.monotonic() - started
-            self._fails = 0 if alive > 60 else self._fails + 1
-            wait = min(30, 2 * self._fails) if self._fails else 1
+            self._fails = 0 if alive > 60 else min(self._fails + 1, 99)
+            wait = min(60, 2 * self._fails) if self._fails else 1
             log.warning("capture exited rc=%s after %.0fs, retry in %ss", rc, alive, wait)
-            if self._fails in (3, 8) and self.fail_cb:
+            if (self._fails in (3, 8) and self.fail_cb
+                    and not winutil.desktop_locked()):
                 try:
                     self.fail_cb(self._fails)
                 except Exception:
                     pass
-            if self._fails >= 8:
-                self.paused = True
-                self._fails = 0
-                continue
             self._stop.wait(wait)
 
     def _kill(self):
