@@ -532,6 +532,16 @@ class PAINTSTRUCT(ctypes.Structure):
                 ("rgbReserved", ctypes.c_byte * 32)]
 
 
+class MONITORINFO(ctypes.Structure):
+    _fields_ = [("cbSize", wt.DWORD), ("rcMonitor", wt.RECT),
+                ("rcWork", wt.RECT), ("dwFlags", wt.DWORD)]
+
+
+user32.GetForegroundWindow.restype = wt.HWND
+user32.MonitorFromWindow.restype = wt.HANDLE
+user32.MonitorFromWindow.argtypes = [wt.HWND, wt.DWORD]
+
+
 user32.BeginPaint.restype = wt.HDC
 user32.BeginPaint.argtypes = [wt.HWND, ctypes.POINTER(PAINTSTRUCT)]
 user32.EndPaint.argtypes = [wt.HWND, ctypes.POINTER(PAINTSTRUCT)]
@@ -623,14 +633,25 @@ class Toast:
         self._body = body
         self._ok = ok
         self._alpha = 235
-        sw = user32.GetSystemMetrics(0)
-        x = sw - self.W - self.M
+        right, top = user32.GetSystemMetrics(0), 0
+        fg = user32.GetForegroundWindow()
+        if fg:
+            mon = user32.MonitorFromWindow(fg, 1)
+            mi = MONITORINFO()
+            mi.cbSize = ctypes.sizeof(MONITORINFO)
+            if mon and user32.GetMonitorInfoW(mon, ctypes.byref(mi)):
+                right, top = mi.rcMonitor.right, mi.rcMonitor.top
+        x = right - self.W - self.M
         user32.KillTimer(self.hwnd, 1)
         user32.KillTimer(self.hwnd, 2)
+        user32.KillTimer(self.hwnd, 3)
         user32.SetLayeredWindowAttributes(self.hwnd, 0, self._alpha, 0x2)
-        user32.SetWindowPos(self.hwnd, -1, x, self.M, self.W, self.H, 0x10 | 0x40)
+        user32.SetWindowPos(self.hwnd, -1, x, top + self.M, self.W, self.H,
+                            0x10 | 0x40)
         user32.InvalidateRect(self.hwnd, None, True)
         user32.SetTimer(self.hwnd, 1, 1800, None)
+        # keep above fullscreen
+        user32.SetTimer(self.hwnd, 3, 250, None)
 
     def _paint(self):
         ps = PAINTSTRUCT()
@@ -672,9 +693,13 @@ class Toast:
                     self._alpha -= 26
                     if self._alpha <= 0:
                         user32.KillTimer(hwnd, 2)
+                        user32.KillTimer(hwnd, 3)
                         user32.ShowWindow(hwnd, 0)  # SW_HIDE
                     else:
                         user32.SetLayeredWindowAttributes(hwnd, 0, self._alpha, 0x2)
+                    return 0
+                if wp == 3:
+                    user32.SetWindowPos(hwnd, -1, 0, 0, 0, 0, 0x13)
                     return 0
         except Exception:
             log.exception("toast wndproc error")
