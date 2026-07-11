@@ -4,6 +4,11 @@ ShadowPlay-style instant replay for Windows. Keeps the last 1-10 minutes of a
 chosen screen in a RAM ring buffer and dumps it to an MP4 when you press the
 hotkey. Runs as a tray icon, starts with Windows.
 
+The whole UI is a tray icon (red dot = buffering, gray = paused) with a menu,
+and this settings window:
+
+![Settings window](docs/settings.png)
+
 ## Setup
 
 Needs Python 3.12+ and a static ffmpeg (not committed here). One time:
