@@ -28,7 +28,8 @@ class SettingsWin:
         self.cfg = cfg
         self.outputs = winutil.list_outputs()
         self.hotkey = dict(cfg["hotkey"])
-        self.capturing = False
+        self.record_hotkey = dict(cfg["record_hotkey"])
+        self.capturing = None
         self.held = set()
 
         root.title("Povtoritel Settings")
@@ -37,7 +38,7 @@ class SettingsWin:
         frm.grid(sticky="nsew")
 
         labels = ["Screen:", "Keep last:", "Frame rate:", "Quality:",
-                  "Save hotkey:", "Save folder:"]
+                  "Replay hotkey:", "Long recording:", "Save folder:"]
         for i, text in enumerate(labels):
             ttk.Label(frm, text=text).grid(row=i, column=0, sticky="w",
                                            padx=(0, 10), pady=4)
@@ -80,7 +81,7 @@ class SettingsWin:
         self.hk_entry = ttk.Entry(frm, textvariable=self.hk_var,
                                   state="readonly", width=22, cursor="hand2")
         self.hk_entry.grid(row=4, column=1, sticky="w", pady=4)
-        self.hk_entry.bind("<Button-1>", self._hk_start)
+        self.hk_entry.bind("<Button-1>", lambda ev: self._hk_start("replay", ev))
         self.hk_entry.bind("<KeyPress>", self._hk_press)
         self.hk_entry.bind("<KeyRelease>", self._hk_release)
         self.hk_entry.bind("<FocusOut>", self._hk_cancel)
@@ -88,22 +89,40 @@ class SettingsWin:
                                  foreground="#777777")
         self.hk_hint.grid(row=4, column=2, sticky="w", padx=6)
 
+        self.record_hk_var = tk.StringVar(value=self.record_hotkey["label"])
+        self.record_hk_entry = ttk.Entry(frm, textvariable=self.record_hk_var,
+                                         state="readonly", width=22,
+                                         cursor="hand2")
+        self.record_hk_entry.grid(row=5, column=1, sticky="w", pady=4)
+        self.record_hk_entry.bind(
+            "<Button-1>", lambda ev: self._hk_start("record", ev))
+        self.record_hk_entry.bind("<KeyPress>", self._hk_press)
+        self.record_hk_entry.bind("<KeyRelease>", self._hk_release)
+        self.record_hk_entry.bind("<FocusOut>", self._hk_cancel)
+        self.hold_for_recording = tk.BooleanVar(
+            value=bool(cfg.get("hold_for_recording", False)))
+        ttk.Checkbutton(frm, text="Hold replay hotkey for 2 seconds",
+                        variable=self.hold_for_recording,
+                        command=self._hold_changed).grid(
+                            row=5, column=2, sticky="w", padx=6)
+        self._hold_changed()
+
         self.folder = tk.StringVar(value=cfg["folder"])
         ttk.Entry(frm, textvariable=self.folder, width=34).grid(
-            row=5, column=1, sticky="w", pady=4)
+            row=6, column=1, sticky="w", pady=4)
         ttk.Button(frm, text="Browse", command=self._browse).grid(
-            row=5, column=2, sticky="w", padx=6)
+            row=6, column=2, sticky="w", padx=6)
 
         self.audio = tk.BooleanVar(value=bool(cfg.get("audio", True)))
         ttk.Checkbutton(frm, text="Record desktop audio (full mix track)",
-                        variable=self.audio).grid(row=6, column=1, columnspan=2,
+                        variable=self.audio).grid(row=7, column=1, columnspan=2,
                                                   sticky="w", pady=(8, 0))
 
-        ttk.Label(frm, text="Microphone:").grid(row=7, column=0, sticky="w",
+        ttk.Label(frm, text="Microphone:").grid(row=8, column=0, sticky="w",
                                                 padx=(0, 10), pady=4)
         self.mic = tk.BooleanVar(value=bool(cfg.get("mic", False)))
         ttk.Checkbutton(frm, text="Record", variable=self.mic).grid(
-            row=7, column=1, sticky="w")
+            row=8, column=1, sticky="w")
         try:
             self.mics = audio.list_mics()
         except Exception:
@@ -122,37 +141,37 @@ class SettingsWin:
         self.mic_box = ttk.Combobox(frm, values=mic_names, state="readonly",
                                     width=30)
         self.mic_box.current(sel)
-        self.mic_box.grid(row=7, column=2, sticky="w", padx=6, pady=4)
+        self.mic_box.grid(row=8, column=2, sticky="w", padx=6, pady=4)
 
         self.app_auto = tk.BooleanVar(value=bool(cfg.get("app_auto", True)))
         ttk.Checkbutton(frm, text="Per-app audio tracks (automatic, like"
                                   " Volume Mixer)",
-                        variable=self.app_auto).grid(row=8, column=1,
+                        variable=self.app_auto).grid(row=9, column=1,
                                                      columnspan=2, sticky="w",
                                                      pady=(2, 0))
         ttk.Label(frm, text="Every app that plays sound gets its own track"
                             " named after its exe. Silent ones are dropped.",
-                  foreground="#777777").grid(row=9, column=1, columnspan=2,
+                  foreground="#777777").grid(row=10, column=1, columnspan=2,
                                              sticky="w")
 
         self.priority = tk.BooleanVar(value=bool(cfg.get("capture_priority", False)))
         ttk.Checkbutton(frm, text="High capture priority (smoother under GPU load)",
-                        variable=self.priority).grid(row=11, column=1,
+                        variable=self.priority).grid(row=12, column=1,
                                                      columnspan=2, sticky="w",
                                                      pady=(6, 0))
 
         self.autostart = tk.BooleanVar(value=bool(cfg["autostart"]))
         ttk.Checkbutton(frm, text="Start with Windows",
-                        variable=self.autostart).grid(row=12, column=1,
+                        variable=self.autostart).grid(row=13, column=1,
                                                       sticky="w", pady=(0, 2))
 
         ttk.Label(frm, text="Changes apply live. Silent tracks are dropped"
                             " from saved files automatically.",
-                  foreground="#777777").grid(row=13, column=0, columnspan=3,
+                  foreground="#777777").grid(row=14, column=0, columnspan=3,
                                              sticky="w", pady=(8, 2))
 
         btns = ttk.Frame(frm)
-        btns.grid(row=14, column=0, columnspan=3, sticky="e", pady=(10, 0))
+        btns.grid(row=15, column=0, columnspan=3, sticky="e", pady=(10, 0))
         ttk.Button(btns, text="Save", command=self._save).pack(side="left", padx=4)
         ttk.Button(btns, text="Cancel", command=root.destroy).pack(side="left")
 
@@ -161,19 +180,36 @@ class SettingsWin:
         if d:
             self.folder.set(str(Path(d)))
 
-    def _hk_start(self, _ev=None):
-        self.capturing = True
+    def _hold_changed(self):
+        if self.hold_for_recording.get():
+            if self.capturing == "record":
+                self._hk_cancel()
+            self.record_hk_entry.configure(state="disabled")
+        else:
+            self.record_hk_entry.configure(state="readonly")
+
+    def _hk_values(self):
+        if self.capturing == "record":
+            return self.record_hotkey, self.record_hk_var, self.record_hk_entry
+        return self.hotkey, self.hk_var, self.hk_entry
+
+    def _hk_start(self, target, _ev=None):
+        if target == "record" and self.hold_for_recording.get():
+            return "break"
+        self.capturing = target
         self.held.clear()
-        self.hk_var.set("press keys...")
+        _hotkey, var, entry = self._hk_values()
+        var.set("press keys...")
         self.hk_hint.config(text="modifiers wait for a key, Esc cancels")
-        self.hk_entry.focus_set()
+        entry.focus_set()
         return "break"
 
     def _hk_cancel(self, _ev=None):
         if self.capturing:
-            self.capturing = False
+            hotkey, var, _entry = self._hk_values()
+            self.capturing = None
             self.held.clear()
-            self.hk_var.set(self.hotkey["label"])
+            var.set(hotkey["label"])
             self.hk_hint.config(text="click, then press keys")
 
     def _hk_press(self, ev):
@@ -182,7 +218,8 @@ class SettingsWin:
         if ev.keysym in MODKEYS:
             self.held.add(MODKEYS[ev.keysym])
             mods = [PRETTY[m] for m in ORDER if m in self.held]
-            self.hk_var.set("+".join(mods) + "+...")
+            _hotkey, var, _entry = self._hk_values()
+            var.set("+".join(mods) + "+...")
             return "break"
         if ev.keysym == "Escape":
             self._hk_cancel()
@@ -192,10 +229,15 @@ class SettingsWin:
             return "break"
         mods = [m for m in ORDER if m in self.held]
         label = "+".join([PRETTY[m] for m in mods] + [keyname(ev.keysym)])
-        self.hotkey = {"mods": mods, "vk": vk, "label": label}
-        self.capturing = False
+        target = self.capturing
+        if target == "record":
+            self.record_hotkey = {"mods": mods, "vk": vk, "label": label}
+        else:
+            self.hotkey = {"mods": mods, "vk": vk, "label": label}
+        _hotkey, var, _entry = self._hk_values()
+        self.capturing = None
         self.held.clear()
-        self.hk_var.set(label)
+        var.set(label)
         self.hk_hint.config(text="click, then press keys")
         self.root.focus()
         return "break"
@@ -204,11 +246,19 @@ class SettingsWin:
         if self.capturing and ev.keysym in MODKEYS:
             self.held.discard(MODKEYS[ev.keysym])
             if not self.held:
-                self.hk_var.set("press keys...")
+                _hotkey, var, _entry = self._hk_values()
+                var.set("press keys...")
         return "break"
 
     def _save(self):
         folder = self.folder.get().strip()
+        same_hotkey = (self.hotkey["vk"] == self.record_hotkey["vk"]
+                       and set(self.hotkey["mods"])
+                       == set(self.record_hotkey["mods"]))
+        if same_hotkey and not self.hold_for_recording.get():
+            messagebox.showerror(
+                "Povtoritel", "Replay and long recording hotkeys must differ.")
+            return
         try:
             Path(folder).mkdir(parents=True, exist_ok=True)
         except OSError as e:
@@ -223,6 +273,8 @@ class SettingsWin:
         self.cfg["fps"] = int(self.fps.get())
         self.cfg["quality"] = qual
         self.cfg["hotkey"] = dict(self.hotkey)
+        self.cfg["record_hotkey"] = dict(self.record_hotkey)
+        self.cfg["hold_for_recording"] = bool(self.hold_for_recording.get())
         self.cfg["folder"] = folder
         self.cfg["audio"] = bool(self.audio.get())
         self.cfg["mic"] = bool(self.mic.get())

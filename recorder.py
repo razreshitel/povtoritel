@@ -108,6 +108,8 @@ class Recorder:
         self._pipe_seq = 0
         self.last_data = time.monotonic()
         self.thread = None
+        self._recording = None
+        self._restart_after_recording = False
 
     def configure(self, cfg):
         restart = (dict(cfg["screen"]) != self.screen
@@ -132,7 +134,11 @@ class Recorder:
         self.priority = bool(cfg.get("capture_priority", False))
         self.offset_ms = int(cfg.get("audio_offset_ms", 0))
         if restart and self.thread and not self.paused:
-            self.restart()
+            if self.recording():
+                self._restart_after_recording = True
+                log.info("capture restart deferred until recording stops")
+            else:
+                self.restart()
 
     def _probe(self, loopback, device, label):
         try:
@@ -222,6 +228,9 @@ class Recorder:
             cut = now - 660
             while dq and dq[0] < cut:
                 dq.popleft()
+            with self.lock:
+                if self._recording:
+                    self._recording["active"].add(src["label"])
 
     def _sink_for(self, proc, src):
         ok = kernel32.ConnectNamedPipe(src["pipe_handle"], None)
@@ -515,6 +524,20 @@ class Recorder:
                 with self.lock:
                     self.chunks.append((now, data))
                     self.total += len(data)
+                    recording = self._recording
+                    if recording and recording["file"]:
+                        try:
+                            recording["file"].write(data)
+                            recording["bytes"] += len(data)
+                            recording["last"] = now
+                        except OSError as e:
+                            recording["error"] = str(e)
+                            try:
+                                recording["file"].close()
+                            except OSError:
+                                pass
+                            recording["file"] = None
+                            log.exception("continuous recording write failed")
                     keep = self.minutes * 60 + KEEP_PAD
                     while self.chunks and self.chunks[0][0] < now - keep:
                         self.total -= len(self.chunks.popleft()[1])
@@ -523,6 +546,8 @@ class Recorder:
             os.close(rfd)
             rc = proc.wait()
             self.proc = None
+            if not (self._stop.is_set() or self.paused or self._restart):
+                self._interrupt_recording("capture stopped unexpectedly")
             for s in srcs:
                 _poke_pipe(s["pipe_name"])
             for th in feeders:
@@ -560,11 +585,25 @@ class Recorder:
         except OSError:
             pass
 
+    def _interrupt_recording(self, reason):
+        with self.lock:
+            recording = self._recording
+            if not recording or not recording["file"]:
+                return
+            recording["error"] = reason
+            try:
+                recording["file"].close()
+            except OSError:
+                pass
+            recording["file"] = None
+
     def restart(self):
+        self._interrupt_recording("capture restarted")
         self._restart = True
         self._kill()
 
     def pause(self):
+        self._interrupt_recording("capture paused")
         self.paused = True
         self._kill()
 
@@ -573,12 +612,109 @@ class Recorder:
         self._wake.set()
 
     def stop(self):
+        self._interrupt_recording("recorder stopped")
         self._stop.set()
         self.paused = False
         self._wake.set()
         self._kill()
         if self.thread:
             self.thread.join(5)
+
+    def recording(self):
+        with self.lock:
+            return self._recording is not None
+
+    def recording_status(self):
+        with self.lock:
+            if not self._recording:
+                return False, 0.0, 0
+            state = self._recording
+            return True, max(0.0, state["last"] - state["started"]), state["bytes"]
+
+    def start_recording(self, folder):
+        folder = Path(folder)
+        folder.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        suffix = ""
+        index = 1
+        while True:
+            temp = folder / f".recording_{stamp}_{os.getpid()}{suffix}.ts"
+            out = folder / f"recording_{stamp}{suffix}.mp4"
+            if not temp.exists() and not out.exists():
+                break
+            suffix = f"_{index}"
+            index += 1
+        stream = open(temp, "xb", buffering=0)
+        now = time.monotonic()
+        with self.lock:
+            if self._recording:
+                stream.close()
+                temp.unlink(missing_ok=True)
+                raise RuntimeError("recording already active")
+            proc = self.proc
+            if self.paused or proc is None or proc.poll() is not None:
+                stream.close()
+                temp.unlink(missing_ok=True)
+                raise RuntimeError("capture is not running")
+            self._recording = {
+                "file": stream, "temp": temp, "out": out,
+                "started": now, "last": now, "bytes": 0,
+                "layout": list(self.layout), "active": set(), "error": None,
+            }
+        log.info("continuous recording started: %s", temp.name)
+        return temp
+
+    def stop_recording(self):
+        with self.lock:
+            state = self._recording
+            if not state:
+                raise RuntimeError("recording is not active")
+            self._recording = None
+            names = dict(self.slot_names)
+            restart_after = self._restart_after_recording
+            self._restart_after_recording = False
+        if restart_after:
+            self.restart()
+        stream = state["file"]
+        if stream:
+            stream.close()
+        if state["error"]:
+            log.warning("finalizing interrupted recording: %s", state["error"])
+        if state["bytes"] <= 0:
+            state["temp"].unlink(missing_ok=True)
+            raise RuntimeError("recording contains no video")
+
+        maps = ["-map", "0:v:0"]
+        meta = []
+        kept = []
+        out_a = 0
+        for i, (label, title) in enumerate(state["layout"]):
+            if label not in state["active"]:
+                continue
+            title = names.get(label, title)
+            maps += ["-map", f"0:a:{i}?"]
+            meta += [f"-metadata:s:a:{out_a}", f"handler_name={title}",
+                     f"-metadata:s:a:{out_a}", f"title={title}"]
+            kept.append(title)
+            out_a += 1
+        out = state["out"]
+        with open(self.err_log, "ab") as errf:
+            rc = subprocess.run(
+                [self.ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+                 "-fflags", "+genpts", "-f", "mpegts", "-i", str(state["temp"])]
+                + maps + ["-c", "copy"] + meta
+                + ["-movflags", "+faststart", str(out)],
+                stdout=subprocess.DEVNULL, stderr=errf,
+                creationflags=CREATE_NO_WINDOW).returncode
+        if rc != 0 or not out.exists() or out.stat().st_size == 0:
+            raise RuntimeError(
+                f"recording remux failed rc={rc}; source kept at {state['temp']}")
+        state["temp"].unlink(missing_ok=True)
+        size = out.stat().st_size
+        dur = max(0.0, state["last"] - state["started"])
+        log.info("continuous recording saved %s (%.0f s, %.1f MB), tracks=%s",
+                 out.name, dur, size / 1e6, kept or "none")
+        return out, dur, size
 
     def buffered(self):
         with self.lock:

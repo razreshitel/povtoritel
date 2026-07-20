@@ -13,7 +13,7 @@ from recorder import Recorder
 
 log = logging.getLogger("povtoritel")
 
-MENU_SAVE, MENU_PAUSE, MENU_FOLDER, MENU_SETTINGS, MENU_AUTOSTART, MENU_QUIT = range(1, 7)
+MENU_SAVE, MENU_RECORD, MENU_PAUSE, MENU_FOLDER, MENU_SETTINGS, MENU_AUTOSTART, MENU_QUIT = range(1, 8)
 
 
 class App:
@@ -23,6 +23,7 @@ class App:
         self.recorder.configure(self.cfg)
         self.recorder.fail_cb = self._capture_failing
         self.busy = threading.Lock()
+        self.record_busy = threading.Lock()
         self.ticks = 0
         self._pending_toast = None
         self.tray = winutil.Tray(self._tip(), common.ICON_REC, self.handle)
@@ -31,15 +32,14 @@ class App:
         except Exception:
             log.exception("toast init failed")
             self.toast = None
-        if not self.tray.register_hotkey(self.cfg["hotkey"]["mods"],
-                                         self.cfg["hotkey"]["vk"]):
-            self.tray.balloon("Hotkey unavailable",
-                              f"{self.cfg['hotkey']['label']} is taken by another"
-                              " app. Pick a new one in Settings.")
+        self._register_hotkeys()
         self.recorder.start()
         self.tray.start_timer(60000)
 
     def _tip(self):
+        active, dur, _size = self.recorder.recording_status()
+        if active:
+            return f"Povtoritel: recording {int(dur)}s"
         if self.recorder.paused:
             return "Povtoritel: paused"
         secs, size = self.recorder.buffered()
@@ -49,6 +49,8 @@ class App:
     def handle(self, kind, _data):
         if kind == "save":
             self.save_async()
+        elif kind == "record":
+            self.toggle_recording()
         elif kind == "menu":
             self.menu()
         elif kind == "settings":
@@ -72,11 +74,18 @@ class App:
 
     def menu(self):
         paused = self.recorder.paused
+        recording = self.recorder.recording()
+        record_label = "Stop long recording" if recording else "Start long recording"
+        if self.cfg.get("hold_for_recording", False):
+            record_label += f" (hold {self.cfg['hotkey']['label']} 2s)"
+        else:
+            record_label += f" ({self.cfg['record_hotkey']['label']})"
         items = [
             (MENU_SAVE, f"Save replay now ({self.cfg['hotkey']['label']})",
              False, True),
+            (MENU_RECORD, record_label, recording, True),
             (MENU_PAUSE, "Resume buffering" if paused else "Pause buffering",
-             False, True),
+             False, not recording),
             None,
             (MENU_FOLDER, "Open replays folder", False, True),
             (MENU_SETTINGS, "Settings...", False, True),
@@ -88,6 +97,8 @@ class App:
         cmd = self.tray.popup(items)
         if cmd == MENU_SAVE:
             self.save_async()
+        elif cmd == MENU_RECORD:
+            self.toggle_recording()
         elif cmd == MENU_PAUSE:
             if paused:
                 self.recorder.resume()
@@ -127,12 +138,34 @@ class App:
         finally:
             self.busy.release()
 
+    def toggle_recording(self):
+        if not self.record_busy.acquire(blocking=False):
+            return
+        threading.Thread(target=self._record_job, daemon=True).start()
+
+    def _record_job(self):
+        try:
+            if self.recorder.recording():
+                out, dur, size = self.recorder.stop_recording()
+                self._notify("Recording saved",
+                             f"{dur:.0f}s  -  {size / 1e6:.0f} MB", True)
+            else:
+                self.recorder.start_recording(self.cfg["folder"])
+                self._notify("Recording started", "Press the hotkey again to stop", True)
+        except Exception as e:
+            log.exception("continuous recording failed")
+            self._notify("Recording failed", str(e)[:80], False)
+        finally:
+            self.record_busy.release()
+            self.tray.set_tip(self._tip())
+
     def _notify(self, title, body, ok):
         if self.toast:
-            self._pending_toast = (title, body, ok)
+            monitor = winutil.output_rect(self.cfg["screen"])
+            self._pending_toast = (title, body, ok, monitor)
             winutil.user32.PostMessageW(self.tray.hwnd, winutil.MSG_TOAST, 0, 0)
         else:
-            self.tray.balloon(title, body)
+            log.warning("notification unavailable: %s: %s", title, body)
 
     def open_settings(self):
         subprocess.Popen([common.pythonw(), str(common.SCRIPT), "--settings"])
@@ -140,16 +173,20 @@ class App:
     def reload(self):
         self.cfg = common.load_cfg()
         self.recorder.configure(self.cfg)
-        if not self.tray.register_hotkey(self.cfg["hotkey"]["mods"],
-                                         self.cfg["hotkey"]["vk"]):
-            self.tray.balloon("Hotkey unavailable",
-                              f"{self.cfg['hotkey']['label']} is taken by another"
-                              " app. Pick a new one in Settings.")
-        else:
+        if self._register_hotkeys():
             self.tray.balloon("Settings applied",
                               f"{self.cfg['minutes']} min buffer,"
                               f" save with {self.cfg['hotkey']['label']}")
         self.tray.set_tip(self._tip())
+
+    def _register_hotkeys(self):
+        ok = self.tray.register_hotkeys(
+            self.cfg["hotkey"], self.cfg["record_hotkey"],
+            self.cfg.get("hold_for_recording", False))
+        if not ok:
+            self.tray.balloon("Hotkeys unavailable",
+                              "Global keyboard hook failed. Restart Povtoritel.")
+        return ok
 
     def _capture_failing(self, fails):
         if fails >= 8:
@@ -164,8 +201,14 @@ class App:
                               " (see ffmpeg.log).")
 
     def quit(self):
-        self.recorder.stop()
-        self.tray.destroy()
+        with self.busy, self.record_busy:
+            if self.recorder.recording():
+                try:
+                    self.recorder.stop_recording()
+                except Exception:
+                    log.exception("recording finalization on quit failed")
+            self.recorder.stop()
+            self.tray.destroy()
 
 
 def run_app():

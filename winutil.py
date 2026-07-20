@@ -18,7 +18,10 @@ WNDPROC = ctypes.WINFUNCTYPE(LRESULT, wt.HWND, ctypes.c_uint, wt.WPARAM, wt.LPAR
 
 WM_DESTROY = 0x0002
 WM_TIMER = 0x0113
-WM_HOTKEY = 0x0312
+WM_KEYDOWN = 0x0100
+WM_KEYUP = 0x0101
+WM_SYSKEYDOWN = 0x0104
+WM_SYSKEYUP = 0x0105
 WM_LBUTTONUP = 0x0202
 WM_LBUTTONDBLCLK = 0x0203
 WM_RBUTTONUP = 0x0205
@@ -28,12 +31,13 @@ MSG_SAVE = WM_APP + 2
 MSG_QUIT = WM_APP + 3
 MSG_SETTINGS = WM_APP + 4
 MSG_TOAST = WM_APP + 5
+MSG_HOTKEY_ACTION = WM_APP + 6
 MSG_TRAY = WM_APP + 10
 WM_PAINT = 0x000F
 
-MODS = {"alt": 0x1, "ctrl": 0x2, "shift": 0x4}
-MOD_NOREPEAT = 0x4000
-HOTKEY_ID = 1
+HOTKEY_HOLD_TIMER = 1001
+HOTKEY_HOLD_MS = 2000
+WH_KEYBOARD_LL = 13
 WINDOW_CLASS = "PovtoritelTrayWindow"
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 APP_NAME = "Povtoritel"
@@ -59,8 +63,8 @@ user32.DestroyWindow.argtypes = [wt.HWND]
 user32.LoadImageW.restype = wt.HANDLE
 user32.LoadImageW.argtypes = [wt.HINSTANCE, wt.LPCWSTR, ctypes.c_uint,
                               ctypes.c_int, ctypes.c_int, ctypes.c_uint]
-user32.RegisterHotKey.argtypes = [wt.HWND, ctypes.c_int, ctypes.c_uint, ctypes.c_uint]
-user32.UnregisterHotKey.argtypes = [wt.HWND, ctypes.c_int]
+user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
+user32.GetAsyncKeyState.restype = ctypes.c_short
 user32.SetTimer.restype = ctypes.c_size_t
 user32.SetTimer.argtypes = [wt.HWND, ctypes.c_size_t, ctypes.c_uint, wt.LPVOID]
 user32.GetMessageW.argtypes = [ctypes.POINTER(wt.MSG), wt.HWND, ctypes.c_uint, ctypes.c_uint]
@@ -81,6 +85,21 @@ kernel32.CloseHandle.argtypes = [wt.HANDLE]
 kernel32.SetPriorityClass.argtypes = [wt.HANDLE, wt.DWORD]
 gdi32.D3DKMTSetProcessSchedulingPriorityClass.argtypes = [wt.HANDLE, ctypes.c_int]
 gdi32.D3DKMTSetProcessSchedulingPriorityClass.restype = ctypes.c_int32
+
+
+class KBDLLHOOKSTRUCT(ctypes.Structure):
+    _fields_ = [("vkCode", wt.DWORD), ("scanCode", wt.DWORD),
+                ("flags", wt.DWORD), ("time", wt.DWORD),
+                ("dwExtraInfo", ctypes.c_size_t)]
+
+
+HOOKPROC = ctypes.WINFUNCTYPE(LRESULT, ctypes.c_int, wt.WPARAM, wt.LPARAM)
+user32.SetWindowsHookExW.restype = wt.HANDLE
+user32.SetWindowsHookExW.argtypes = [ctypes.c_int, HOOKPROC, wt.HINSTANCE,
+                                     wt.DWORD]
+user32.UnhookWindowsHookEx.argtypes = [wt.HANDLE]
+user32.CallNextHookEx.restype = LRESULT
+user32.CallNextHookEx.argtypes = [wt.HANDLE, ctypes.c_int, wt.WPARAM, wt.LPARAM]
 
 PROCESS_SET_INFORMATION = 0x0200
 PROCESS_QUERY_INFORMATION = 0x0400
@@ -367,6 +386,15 @@ def list_outputs():
     return res
 
 
+def output_rect(screen):
+    for item in list_outputs():
+        if (item["adapter"] == screen.get("adapter")
+                and item["output"] == screen.get("output")):
+            return (item["x"], item["y"], item["x"] + item["w"],
+                    item["y"] + item["h"])
+    return None
+
+
 class Tray:
     def __init__(self, tip, icon_path, handler):
         self.handler = handler
@@ -390,6 +418,11 @@ class Tray:
         self._nid.hIcon = self._load_icon(icon_path)
         self._nid.szTip = tip[:127]
         self._add_icon()
+        self._hook = None
+        self._pressed = set()
+        self._hold_vk = None
+        self._hold_fired = False
+        self._hotkeys = {}
 
     def _add_icon(self):
         import time
@@ -442,40 +475,84 @@ class Tray:
         user32.DestroyMenu(menu)
         return cmd
 
-    def register_hotkey(self, mods, vk):
-        for hid in getattr(self, "_hk_ids", []):
-            user32.UnregisterHotKey(self.hwnd, hid)
-        self._hk_ids = []
-        base = 0
-        for m in mods:
-            base |= MODS.get(m, 0)
-        extras = [v for v in MODS.values() if not base & v]
-        ok = False
-        hid = HOTKEY_ID
-        # extra held modifiers tolerated
-        for n in range(1 << len(extras)):
-            val = base
-            for i, ev in enumerate(extras):
-                if n & (1 << i):
-                    val |= ev
-            if user32.RegisterHotKey(self.hwnd, hid, val | MOD_NOREPEAT, vk):
-                self._hk_ids.append(hid)
-                if n == 0:
-                    ok = True
-            elif n == 0:
-                log.warning("hotkey register failed vk=%#x mods=%#x", vk, val)
-            else:
-                log.info("hotkey combo taken elsewhere, mods=%#x", val)
-            hid += 1
-        return ok
+    def register_hotkeys(self, replay, recording, hold_for_recording):
+        self._hotkeys = {"save": dict(replay), "record": dict(recording)}
+        self._hold_for_recording = bool(hold_for_recording)
+        self._cancel_hold()
+        if self._hook:
+            return True
+        self._hook_proc = HOOKPROC(self._keyboard_proc)
+        self._hook = user32.SetWindowsHookExW(
+            WH_KEYBOARD_LL, self._hook_proc, kernel32.GetModuleHandleW(None), 0)
+        if not self._hook:
+            log.error("keyboard hook failed error=%s", kernel32.GetLastError())
+            return False
+        log.info("global keyboard hook installed")
+        return True
+
+    def _mods_down(self):
+        keys = {"shift": 0x10, "ctrl": 0x11, "alt": 0x12}
+        return {name for name, vk in keys.items()
+                if user32.GetAsyncKeyState(vk) & 0x8000}
+
+    def _matches(self, cfg, vk, down):
+        return (int(cfg.get("vk", 0)) == vk
+                and set(cfg.get("mods", ())).issubset(down))
+
+    def _emit_hotkey(self, action):
+        value = 1 if action == "save" else 2
+        user32.PostMessageW(self.hwnd, MSG_HOTKEY_ACTION, value, 0)
+
+    def _cancel_hold(self):
+        user32.KillTimer(self.hwnd, HOTKEY_HOLD_TIMER)
+        self._hold_vk = None
+        self._hold_fired = False
+
+    def _key_down(self, vk):
+        if vk in self._pressed:
+            return
+        self._pressed.add(vk)
+        down = self._mods_down()
+        if (self._hold_for_recording
+                and self._matches(self._hotkeys["save"], vk, down)):
+            self._hold_vk = vk
+            self._hold_fired = False
+            user32.SetTimer(self.hwnd, HOTKEY_HOLD_TIMER, HOTKEY_HOLD_MS, None)
+            return
+        matches = [(len(cfg.get("mods", ())), action)
+                   for action, cfg in self._hotkeys.items()
+                   if self._matches(cfg, vk, down)]
+        if matches:
+            self._emit_hotkey(max(matches)[1])
+
+    def _key_up(self, vk):
+        self._pressed.discard(vk)
+        if vk != self._hold_vk:
+            return
+        fired = self._hold_fired
+        self._cancel_hold()
+        if not fired:
+            self._emit_hotkey("save")
+
+    def _keyboard_proc(self, code, wp, lp):
+        try:
+            if code >= 0:
+                data = ctypes.cast(lp, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
+                if wp in (WM_KEYDOWN, WM_SYSKEYDOWN):
+                    self._key_down(int(data.vkCode))
+                elif wp in (WM_KEYUP, WM_SYSKEYUP):
+                    self._key_up(int(data.vkCode))
+        except Exception:
+            log.exception("keyboard hook error")
+        return user32.CallNextHookEx(self._hook, code, wp, lp)
 
     def start_timer(self, ms):
         user32.SetTimer(self.hwnd, 1, ms, None)
 
     def _wndproc(self, hwnd, msg, wp, lp):
         try:
-            if msg == WM_HOTKEY:
-                self.handler("save", None)
+            if msg == MSG_HOTKEY_ACTION:
+                self.handler("save" if wp == 1 else "record", None)
                 return 0
             if msg == MSG_TRAY:
                 ev = lp & 0xFFFF
@@ -497,6 +574,12 @@ class Tray:
                 self.handler("settings", None)
                 return 0
             if msg == WM_TIMER:
+                if wp == HOTKEY_HOLD_TIMER:
+                    user32.KillTimer(hwnd, HOTKEY_HOLD_TIMER)
+                    if self._hold_vk in self._pressed:
+                        self._hold_fired = True
+                        self._emit_hotkey("record")
+                    return 0
                 self.handler("timer", None)
                 return 0
             if msg == MSG_TOAST:
@@ -520,8 +603,10 @@ class Tray:
             user32.DispatchMessageW(ctypes.byref(msg))
 
     def destroy(self):
-        for hid in getattr(self, "_hk_ids", [HOTKEY_ID]):
-            user32.UnregisterHotKey(self.hwnd, hid)
+        self._cancel_hold()
+        if self._hook:
+            user32.UnhookWindowsHookEx(self._hook)
+            self._hook = None
         shell32.Shell_NotifyIconW(NIM_DELETE, ctypes.byref(self._nid))
         user32.DestroyWindow(self.hwnd)
 
@@ -530,16 +615,6 @@ class PAINTSTRUCT(ctypes.Structure):
     _fields_ = [("hdc", wt.HDC), ("fErase", wt.BOOL), ("rcPaint", wt.RECT),
                 ("fRestore", wt.BOOL), ("fIncUpdate", wt.BOOL),
                 ("rgbReserved", ctypes.c_byte * 32)]
-
-
-class MONITORINFO(ctypes.Structure):
-    _fields_ = [("cbSize", wt.DWORD), ("rcMonitor", wt.RECT),
-                ("rcWork", wt.RECT), ("dwFlags", wt.DWORD)]
-
-
-user32.GetForegroundWindow.restype = wt.HWND
-user32.MonitorFromWindow.restype = wt.HANDLE
-user32.MonitorFromWindow.argtypes = [wt.HWND, wt.DWORD]
 
 
 user32.BeginPaint.restype = wt.HDC
@@ -628,19 +703,15 @@ class Toast:
         return gdi32.CreateFontW(-px, 0, 0, 0, weight, 0, 0, 0, 1, 0, 0, 5, 0,
                                  "Segoe UI")
 
-    def show(self, title, body, ok=True):
+    def show(self, title, body, ok=True, monitor=None):
         self._title = title
         self._body = body
         self._ok = ok
         self._alpha = 235
-        right, top = user32.GetSystemMetrics(0), 0
-        fg = user32.GetForegroundWindow()
-        if fg:
-            mon = user32.MonitorFromWindow(fg, 1)
-            mi = MONITORINFO()
-            mi.cbSize = ctypes.sizeof(MONITORINFO)
-            if mon and user32.GetMonitorInfoW(mon, ctypes.byref(mi)):
-                right, top = mi.rcMonitor.right, mi.rcMonitor.top
+        if monitor:
+            _left, top, right, _bottom = monitor
+        else:
+            right, top = user32.GetSystemMetrics(0), 0
         x = right - self.W - self.M
         user32.KillTimer(self.hwnd, 1)
         user32.KillTimer(self.hwnd, 2)
@@ -699,7 +770,8 @@ class Toast:
                         user32.SetLayeredWindowAttributes(hwnd, 0, self._alpha, 0x2)
                     return 0
                 if wp == 3:
-                    user32.SetWindowPos(hwnd, -1, 0, 0, 0, 0, 0x13)
+                    user32.ShowWindow(hwnd, 8)
+                    user32.SetWindowPos(hwnd, -1, 0, 0, 0, 0, 0x53)
                     return 0
         except Exception:
             log.exception("toast wndproc error")

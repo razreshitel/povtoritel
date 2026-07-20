@@ -57,20 +57,27 @@ pythonw povtoritel.pyw
   configured window. Nothing is written to disk until you save.
 - On hotkey the buffered bytes are remuxed to MP4 with `-c copy`
   (no re-encode), so saving takes about a second.
+- Long recording writes the same encoded stream to a temporary MPEG-TS file
+  from Start to Stop, then remuxes it to MP4 without starting a second capture
+  or encoder session.
 
 ## Usage
 
-- Hotkey (default `Ctrl+Alt+R`): save the last X minutes to the replays
-  folder (configured to `E:\Videos\Replays` on this box). On completion a
-  small toast appears top-right of the primary screen for ~1 second (green
-  dot on success, red on failure). It is click-through, never steals focus,
-  and is excluded from the capture itself so it never shows up in replays.
+- Replay hotkey (default `Ctrl+Alt+R`): save the last X minutes.
+- Long recording hotkey (default `Ctrl+Alt+L`): start recording now, then
+  press it again to stop and save. The Settings checkbox can instead use a
+  two-second hold of the replay hotkey for both Start and Stop. A quick press
+  still saves an instant replay.
+- Save notifications always appear at the top-right of the screen selected
+  for capture, even when another screen has focus. The toast is click-through,
+  kept above fullscreen apps, never steals focus, and is excluded from capture.
 - Tray icon: red dot = buffering, gray = paused.
-  - Left or right click: menu (Save replay now, Pause, Open folder,
-    Settings, Start with Windows, Quit).
+  - Left or right click: menu (Save replay now, Start or Stop long recording,
+    Pause, Open folder, Settings, Start with Windows, Quit).
   - Double click: Settings.
 - Settings window: screen picker, buffer length 1-10 min, 30/60/120/144
-  fps, quality (Low/Medium/High bitrate caps), hotkey, save folder,
+  fps, quality (Low/Medium/High bitrate caps), both hotkeys, two-second hold,
+  save folder,
   desktop audio on/off, microphone on/off with device picker, automatic
   per-app tracks on/off, capture priority, autostart. Changes apply live;
   capture restarts when capture-affecting settings change.
@@ -85,8 +92,9 @@ Esc cancels.
 
 Extra held modifiers are tolerated: with the hotkey set to `F11`, pressing
 it while holding Shift or Ctrl (sprinting or crouching in a game) still
-saves. The app registers every modifier superset of the combo; supersets
-already taken by other apps are skipped and logged.
+saves. Hotkeys use a global low-level keyboard hook, so they still receive
+key presses when a fullscreen game does not deliver `RegisterHotKey` events.
+Keys are never blocked from reaching the game.
 
 ## CLI
 
