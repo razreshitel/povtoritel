@@ -519,11 +519,10 @@ class Tray:
             self._hold_fired = False
             user32.SetTimer(self.hwnd, HOTKEY_HOLD_TIMER, HOTKEY_HOLD_MS, None)
             return
-        matches = [(len(cfg.get("mods", ())), action)
-                   for action, cfg in self._hotkeys.items()
-                   if self._matches(cfg, vk, down)]
-        if matches:
-            self._emit_hotkey(max(matches)[1])
+        if self._matches(self._hotkeys["record"], vk, down):
+            self._emit_hotkey("record")
+        elif self._matches(self._hotkeys["save"], vk, down):
+            self._emit_hotkey("save")
 
     def _key_up(self, vk):
         self._pressed.discard(vk)

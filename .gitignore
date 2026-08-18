@@ -5,6 +5,7 @@ bin/
 config.json
 
 # runtime-generated icons
+icon_active.ico
 icon_rec.ico
 icon_pause.ico
 

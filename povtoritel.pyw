@@ -26,7 +26,7 @@ class App:
         self.record_busy = threading.Lock()
         self.ticks = 0
         self._pending_toast = None
-        self.tray = winutil.Tray(self._tip(), common.ICON_REC, self.handle)
+        self.tray = winutil.Tray(self._tip(), common.ICON_ACTIVE, self.handle)
         try:
             self.toast = winutil.Toast()
         except Exception:
@@ -46,6 +46,16 @@ class App:
         return (f"Povtoritel: {int(secs)}s of {self.cfg['minutes']} min buffered,"
                 f" {size / 1e6:.0f} MB RAM, {self.cfg['hotkey']['label']}")
 
+    def _update_tray(self):
+        if self.recorder.recording():
+            icon = common.ICON_REC
+        elif self.recorder.paused:
+            icon = common.ICON_PAUSE
+        else:
+            icon = common.ICON_ACTIVE
+        self.tray.set_icon(icon)
+        self.tray.set_tip(self._tip())
+
     def handle(self, kind, _data):
         if kind == "save":
             self.save_async()
@@ -61,10 +71,10 @@ class App:
             if self.toast and self._pending_toast:
                 self.toast.show(*self._pending_toast)
         elif kind == "timer":
-            self.tray.set_tip(self._tip())
             if self.recorder.stalled():
                 log.warning("capture stalled, restarting")
                 self.recorder.restart()
+            self._update_tray()
             self.ticks += 1
             if self.ticks % 5 == 0:
                 secs, size = self.recorder.buffered()
@@ -102,11 +112,9 @@ class App:
         elif cmd == MENU_PAUSE:
             if paused:
                 self.recorder.resume()
-                self.tray.set_icon(common.ICON_REC)
             else:
                 self.recorder.pause()
-                self.tray.set_icon(common.ICON_PAUSE)
-            self.tray.set_tip(self._tip())
+            self._update_tray()
         elif cmd == MENU_FOLDER:
             Path(self.cfg["folder"]).mkdir(parents=True, exist_ok=True)
             os.startfile(self.cfg["folder"])
@@ -157,7 +165,7 @@ class App:
             self._notify("Recording failed", str(e)[:80], False)
         finally:
             self.record_busy.release()
-            self.tray.set_tip(self._tip())
+            self._update_tray()
 
     def _notify(self, title, body, ok):
         if self.toast:
@@ -177,7 +185,7 @@ class App:
             self.tray.balloon("Settings applied",
                               f"{self.cfg['minutes']} min buffer,"
                               f" save with {self.cfg['hotkey']['label']}")
-        self.tray.set_tip(self._tip())
+        self._update_tray()
 
     def _register_hotkeys(self):
         ok = self.tray.register_hotkeys(
@@ -227,7 +235,8 @@ def run_app():
     if not got:
         return
     common.rotate(common.FF_LOG)
-    for path, color in ((common.ICON_REC, (224, 48, 48)),
+    for path, color in ((common.ICON_ACTIVE, (48, 180, 86)),
+                        (common.ICON_REC, (224, 48, 48)),
                         (common.ICON_PAUSE, (140, 140, 140))):
         if not path.exists():
             winutil.write_ico(path, color)
