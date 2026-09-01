@@ -173,8 +173,20 @@ class Recorder:
                 srcs.append({"label": "mic", "title": "Microphone",
                              "kind": "mic", "fmt": fmt,
                              "device": self.mic_device, "thresh": MIC_THRESH})
+        desktop = next((s for s in srcs if s["label"] == "desktop"), None)
+        mic = next((s for s in srcs if s["label"] == "mic"), None)
+        full_activity = collections.deque() if desktop and mic else None
         for s in srcs:
-            s["act"] = collections.deque()
+            if s is desktop and full_activity is not None:
+                s["track_label"] = "full"
+                s["track_title"] = "Full"
+                s["acts"] = {"full": full_activity}
+            else:
+                s["track_label"] = s["label"]
+                s["track_title"] = s["title"]
+                s["acts"] = {s["label"]: collections.deque()}
+        if mic and full_activity is not None:
+            mic["acts"]["full"] = full_activity
         return srcs
 
     def _cmd(self, srcs):
@@ -192,17 +204,28 @@ class Recorder:
             enc = ["-c:v", "h264_nvenc", "-preset", "p4", "-tune", "hq",
                    "-rc", "vbr", "-cq", str(cq), "-b:v", "0",
                    "-maxrate", f"{mbit}M", "-bufsize", f"{mbit * 2}M"]
+        filters = [grab]
+        full_inputs = [i for i, s in enumerate(srcs)
+                       if s["label"] in ("desktop", "mic")]
+        if len(full_inputs) == 2:
+            filters.append(
+                f"[{full_inputs[0]}:a][{full_inputs[1]}:a]"
+                "amix=inputs=2:duration=longest:dropout_transition=0:normalize=0[full]")
         cmd = [self.ffmpeg, "-hide_banner", "-loglevel", "warning", "-y",
                "-init_hw_device", f"d3d11va=gpu:{a}", "-filter_hw_device", "gpu",
-               "-filter_complex", grab]
+               "-filter_complex", ";".join(filters)]
         maps = []
+        mapped = set()
         for idx, s in enumerate(srcs):
             rate, ch, is_float = s["fmt"]
             if self.offset_ms:
                 cmd += ["-itsoffset", str(self.offset_ms / 1000)]
             cmd += ["-f", "f32le" if is_float else "s16le", "-ar", str(rate),
                     "-ac", str(ch), "-i", s["pipe_name"]]
-            maps += ["-map", f"{idx}:a"]
+            label = s["track_label"]
+            if label not in mapped:
+                maps += ["-map", "[full]" if label == "full" else f"{idx}:a"]
+                mapped.add(label)
         cmd += enc
         if srcs:
             cmd += ["-c:a", "aac", "-b:a", "160k"] + maps
@@ -222,15 +245,18 @@ class Recorder:
             log.exception("boost failed")
 
     def _mark(self, src, now):
-        dq = src["act"]
-        if not dq or now - dq[-1] > 0.5:
-            dq.append(now)
-            cut = now - 660
-            while dq and dq[0] < cut:
-                dq.popleft()
+        marked = []
+        for label, dq in src["acts"].items():
+            if not dq or now - dq[-1] > 0.5:
+                dq.append(now)
+                marked.append(label)
+                cut = now - 660
+                while dq and dq[0] < cut:
+                    dq.popleft()
+        if marked:
             with self.lock:
                 if self._recording:
-                    self._recording["active"].add(src["label"])
+                    self._recording["active"].update(marked)
 
     def _sink_for(self, proc, src):
         ok = kernel32.ConnectNamedPipe(src["pipe_handle"], None)
@@ -453,11 +479,18 @@ class Recorder:
                     log.warning("pipe for %s failed: %s", s["label"], e)
             srcs = live
             names = {}
+            layout = []
+            activity = {}
+            for s in srcs:
+                label = s["track_label"]
+                if label not in activity:
+                    layout.append((label, s["track_title"]))
+                    activity[label] = s["acts"][label]
             with self.lock:
                 self.chunks.clear()
                 self.total = 0
-                self.layout = [(s["label"], s["title"]) for s in srcs]
-                self.activity = {s["label"]: s["act"] for s in srcs}
+                self.layout = layout
+                self.activity = activity
                 self.slot_names = names
                 self._overflow = set()
             cmd = self._cmd(srcs)
@@ -507,9 +540,11 @@ class Recorder:
                 threading.Thread(target=self._watch_sessions,
                                  args=(proc, slots, names), daemon=True).start()
             log.info("capture started: adapter=%s output=%s fps=%s quality=%s"
-                     " audio=%s app_slots=%s",
+                     " audio=%s full_mix=%s app_slots=%s",
                      self.screen.get("adapter"), self.screen.get("output"),
-                     self.fps, self.quality, self.audio_on, len(slots))
+                     self.fps, self.quality, self.audio_on,
+                     any(s["track_label"] == "full" for s in srcs),
+                     len(slots))
             started = time.monotonic()
             self.last_data = started
             while True:

@@ -58,8 +58,8 @@ py povtoritel.pyw --check
 ## Notes
 
 - One screen is recorded at a time.
-- Desktop audio, microphone audio, and automatic per-application tracks are
-  configurable.
+- Desktop audio is saved as a Full track (desktop + microphone). Microphone
+  and automatic per-application tracks remain separate and configurable.
 - The RAM buffer is cleared when capture restarts.
 - Screen lock and display sleep temporarily suspend capture. Recovery is
   automatic when the desktop becomes available.

@@ -114,7 +114,7 @@ class SettingsWin:
             row=6, column=2, sticky="w", padx=6)
 
         self.audio = tk.BooleanVar(value=bool(cfg.get("audio", True)))
-        ttk.Checkbutton(frm, text="Record desktop audio (full mix track)",
+        ttk.Checkbutton(frm, text="Record desktop audio (Full track with microphone)",
                         variable=self.audio).grid(row=7, column=1, columnspan=2,
                                                   sticky="w", pady=(8, 0))
 
