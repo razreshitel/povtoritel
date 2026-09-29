@@ -626,9 +626,12 @@ user32.InvalidateRect.argtypes = [wt.HWND, ctypes.c_void_p, wt.BOOL]
 user32.SetWindowRgn.argtypes = [wt.HWND, wt.HRGN, wt.BOOL]
 user32.SetLayeredWindowAttributes.argtypes = [wt.HWND, wt.COLORREF,
                                               ctypes.c_ubyte, wt.DWORD]
+user32.SetWindowPos.restype = wt.BOOL
 user32.SetWindowPos.argtypes = [wt.HWND, wt.HWND, ctypes.c_int, ctypes.c_int,
                                 ctypes.c_int, ctypes.c_int, ctypes.c_uint]
 user32.ShowWindow.argtypes = [wt.HWND, ctypes.c_int]
+user32.IsWindowVisible.restype = wt.BOOL
+user32.IsWindowVisible.argtypes = [wt.HWND]
 user32.SetWindowDisplayAffinity.argtypes = [wt.HWND, wt.DWORD]
 gdi32.CreateSolidBrush.restype = wt.HBRUSH
 gdi32.CreateSolidBrush.argtypes = [wt.COLORREF]
@@ -693,9 +696,12 @@ class Toast:
         rgn = gdi32.CreateRoundRectRgn(0, 0, self.W + 1, self.H + 1, r * 2, r * 2)
         user32.SetWindowRgn(self.hwnd, rgn, False)
         try:
-            user32.SetWindowDisplayAffinity(self.hwnd, 0x11)  # EXCLUDEFROMCAPTURE
+            self.excluded = bool(
+                user32.SetWindowDisplayAffinity(self.hwnd, 0x11))  # EXCLUDEFROMCAPTURE
         except Exception:
-            pass
+            self.excluded = False
+        if not self.excluded:
+            log.warning("toast capture exclusion unavailable")
         user32.SetLayeredWindowAttributes(self.hwnd, 0, self._alpha, 0x2)
 
     def _font(self, px, weight):
@@ -703,6 +709,8 @@ class Toast:
                                  "Segoe UI")
 
     def show(self, title, body, ok=True, monitor=None):
+        if not self.hwnd:
+            return False
         self._title = title
         self._body = body
         self._ok = ok
@@ -716,12 +724,13 @@ class Toast:
         user32.KillTimer(self.hwnd, 2)
         user32.KillTimer(self.hwnd, 3)
         user32.SetLayeredWindowAttributes(self.hwnd, 0, self._alpha, 0x2)
-        user32.SetWindowPos(self.hwnd, -1, x, top + self.M, self.W, self.H,
-                            0x10 | 0x40)
+        shown = user32.SetWindowPos(self.hwnd, -1, x, top + self.M, self.W, self.H,
+                                    0x10 | 0x40)
         user32.InvalidateRect(self.hwnd, None, True)
         user32.SetTimer(self.hwnd, 1, 1800, None)
         # keep above fullscreen
         user32.SetTimer(self.hwnd, 3, 250, None)
+        return bool(shown and user32.IsWindowVisible(self.hwnd))
 
     def _paint(self):
         ps = PAINTSTRUCT()

@@ -289,13 +289,18 @@ class SettingsWin:
         else:
             winutil.remove_autostart()
         if not winutil.post_to_running(winutil.MSG_RELOAD):
-            subprocess.Popen([common.pythonw(), str(common.SCRIPT)])
+            subprocess.Popen(common.launch_cmd())
         self.root.destroy()
 
 
 def run(selftest=False):
     winutil.set_dpi_aware()
     root = tk.Tk()
+    if common.ICON_APP.exists():
+        try:
+            root.iconbitmap(default=str(common.ICON_APP))
+        except tk.TclError:
+            pass
     cfg = common.load_cfg()
     SettingsWin(root, cfg)
     if selftest:

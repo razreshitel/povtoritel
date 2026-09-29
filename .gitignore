@@ -16,3 +16,7 @@ icon_pause.ico
 # python cache
 __pycache__/
 *.pyc
+
+# native launcher, build with launcher/build.ps1
+Povtoritel.exe
+launcher/build/

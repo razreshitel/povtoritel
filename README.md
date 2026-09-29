@@ -19,17 +19,25 @@ Windows.
 git clone https://github.com/razreshitel/povtoritel.git
 cd povtoritel
 powershell -ExecutionPolicy Bypass -File setup.ps1
-pythonw povtoritel.pyw
+.\Povtoritel.exe
 ```
 
-The setup script downloads FFmpeg. On first launch, the application creates
-its configuration, tray icons, and autostart entry.
+The setup script downloads FFmpeg and, when Visual Studio C++ Build Tools are
+installed, builds `Povtoritel.exe`: a small launcher that runs the application
+in-process with its own name and icon, so Task Manager shows "Povtoritel"
+instead of Python. Rebuild it with `launcher\build.ps1` after changing the
+Python version. Without the launcher, `pythonw povtoritel.pyw` still works; when
+the launcher exists, it is used automatically. On first launch, the application
+creates its configuration, tray icons, and autostart entry.
 
 ## Usage
 
 - The replay hotkey saves the configured number of recent minutes.
 - The recording hotkey starts or stops continuous recording.
 - Continuous recording can instead use a two-second hold of the replay hotkey.
+- During continuous recording, a reminder appears every 30 minutes
+  (`record_reminder_min` in `config.json`, 0 disables it). Like other
+  notifications, it is excluded from the recording.
 - Additional held Shift, Ctrl, or Alt keys do not prevent a configured hotkey
   from working. If replay and recording combinations overlap, recording takes
   priority and only one action is performed.
@@ -48,7 +56,7 @@ displayed on the captured screen and are excluded from the recording.
 ## Commands
 
 ```powershell
-pythonw povtoritel.pyw
+.\Povtoritel.exe
 py povtoritel.pyw --settings
 py povtoritel.pyw --save
 py povtoritel.pyw --quit

@@ -65,6 +65,10 @@ def _close_pipe(src):
         src["pipe_handle"] = None
 
 
+class _FormatChanged(Exception):
+    pass
+
+
 def _peak(data, is_float):
     if is_float:
         arr = array.array("f")
@@ -270,26 +274,68 @@ class Recorder:
         src["pipe_handle"] = None
         return os.fdopen(fd, "wb", 0)
 
+    def _open_capture(self, src, loopback):
+        cap = audio.Capture(loopback, src.get("device") or None)
+        fmt = (cap.rate, cap.channels, cap.is_float)
+        if fmt != tuple(src["fmt"]):
+            cap.close()
+            raise _FormatChanged(f"{fmt} != {tuple(src['fmt'])}")
+        return cap
+
+    def _request_restart(self, reason):
+        log.warning("capture restart requested: %s", reason)
+        with self.lock:
+            if self._recording:
+                self._restart_after_recording = True
+                return
+        self.restart()
+
     def _feed_dev(self, proc, spawn_t, src):
         audio.com_init()
         cap = None
         sink = None
         loopback = src["kind"] == "loopback"
+        label = src["label"]
+        rate, ch, isf = src["fmt"]
+        block = ch * (4 if isf else 2)
+        lost = "lost_" + label
         try:
             sink = self._sink_for(proc, src)
             if sink is None:
                 return
-            cap = audio.Capture(loopback, src.get("device") or None)
-            rate, block, isf = cap.rate, cap.block, cap.is_float
             lead = int((time.monotonic() - spawn_t) * rate)
             sent = 0
             if 0 < lead < rate * 3:
                 sink.write(bytes(lead * block))
                 sent = lead
             quiet = time.monotonic()
+            next_open = 0.0
             while proc.poll() is None and not self._stop.is_set():
-                data = cap.read()
                 now = time.monotonic()
+                if cap is None and now >= next_open:
+                    next_open = now + 1
+                    try:
+                        cap = self._open_capture(src, loopback)
+                    except _FormatChanged as e:
+                        self._note_lost(lost, label, f"format changed: {e}")
+                        if now - spawn_t > 30 and not src.get("restarted"):
+                            src["restarted"] = True
+                            self._request_restart(f"{label} {e}")
+                    except OSError as e:
+                        self._note_lost(lost, label, e)
+                    else:
+                        quiet = now
+                        if lost in self._warned:
+                            self._warned.discard(lost)
+                            log.info("%s capture recovered", label)
+                data = b""
+                if cap:
+                    try:
+                        data = cap.read()
+                    except OSError as e:
+                        cap = self._drop(cap)
+                        next_open = now + 0.2
+                        self._note_lost(lost, label, e)
                 if data:
                     sink.write(data)
                     sent += len(data) // block
@@ -301,31 +347,41 @@ class Recorder:
                     n = min(target - sent, rate // 2)
                     sink.write(bytes(n * block))
                     sent += n
-                if loopback and now - quiet > 10:
+                if loopback and cap and now - quiet > 10:
                     quiet = now
                     try:
-                        ncap = audio.Capture(True, src.get("device") or None)
-                    except OSError:
+                        ncap = self._open_capture(src, loopback)
+                    except Exception:
                         pass
                     else:
-                        cap.close()
+                        self._drop(cap)
                         cap = ncap
                 time.sleep(0.005)
         except (OSError, ValueError) as e:
-            log.warning("%s feed ended: %s", src["label"], e)
+            log.warning("%s feed ended: %s", label, e)
         except Exception:
-            log.exception("%s feed failed", src["label"])
+            log.exception("%s feed failed", label)
         finally:
-            if cap:
-                try:
-                    cap.close()
-                except Exception:
-                    pass
+            self._drop(cap)
             if sink:
                 try:
                     sink.close()
                 except (OSError, ValueError):
                     pass
+
+    def _note_lost(self, key, label, err):
+        if key not in self._warned:
+            self._warned.add(key)
+            log.warning("%s capture lost, retrying: %s", label, err)
+
+    @staticmethod
+    def _drop(cap):
+        if cap:
+            try:
+                cap.close()
+            except Exception:
+                pass
+        return None
 
     def _feed_slot(self, proc, spawn_t, src):
         audio.com_init()

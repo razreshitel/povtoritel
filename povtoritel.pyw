@@ -25,6 +25,7 @@ class App:
         self.busy = threading.Lock()
         self.record_busy = threading.Lock()
         self.ticks = 0
+        self._reminded = 0
         self._pending_toast = None
         self.tray = winutil.Tray(self._tip(), common.ICON_ACTIVE, self.handle)
         try:
@@ -69,7 +70,16 @@ class App:
             self.reload()
         elif kind == "toast":
             if self.toast and self._pending_toast:
-                self.toast.show(*self._pending_toast)
+                title, body, ok, monitor, fallback = self._pending_toast
+                try:
+                    shown = self.toast.show(title, body, ok, monitor)
+                except Exception:
+                    log.exception("toast display failed")
+                    shown = False
+                if not shown and fallback:
+                    self.tray.balloon(title, body)
+                elif not shown:
+                    log.warning("toast not shown: %s", title)
         elif kind == "timer":
             if self.recorder.stalled():
                 log.warning("capture stalled, restarting")
@@ -79,6 +89,7 @@ class App:
             if self.ticks % 5 == 0:
                 secs, size = self.recorder.buffered()
                 log.info("buffer: %.0fs, %.1f MB", secs, size / 1e6)
+            self._remind_recording()
         elif kind == "quit":
             self.quit()
 
@@ -159,6 +170,7 @@ class App:
                              f"{dur:.0f}s  -  {size / 1e6:.0f} MB", True)
             else:
                 self.recorder.start_recording(self.cfg["folder"])
+                self._reminded = 0
                 self._notify("Recording started", "Press the hotkey again to stop", True)
         except Exception as e:
             log.exception("continuous recording failed")
@@ -167,16 +179,47 @@ class App:
             self.record_busy.release()
             self._update_tray()
 
-    def _notify(self, title, body, ok):
-        if self.toast:
-            monitor = winutil.output_rect(self.cfg["screen"])
-            self._pending_toast = (title, body, ok, monitor)
-            winutil.user32.PostMessageW(self.tray.hwnd, winutil.MSG_TOAST, 0, 0)
+    def _remind_recording(self):
+        try:
+            every = float(self.cfg.get("record_reminder_min", 30)) * 60
+        except (TypeError, ValueError):
+            every = 30 * 60
+        active, dur, _size = self.recorder.recording_status()
+        if not active or every <= 0:
+            self._reminded = 0
+            return
+        due = int(dur // every)
+        if due <= self._reminded:
+            return
+        self._reminded = due
+        elapsed = _minutes_text(round(due * every / 60))
+        if self.cfg.get("hold_for_recording", False):
+            hint = f"Hold {self.cfg['hotkey']['label']} for 2s to stop"
         else:
-            log.warning("notification unavailable: %s: %s", title, body)
+            hint = f"Press {self.cfg['record_hotkey']['label']} to stop"
+        log.info("recording reminder: %s", elapsed)
+        # balloons would be captured
+        self._notify(f"Still recording: {elapsed}", hint, True, fallback=False)
+
+    def _notify(self, title, body, ok, fallback=True):
+        if self.toast and (fallback or self.toast.excluded):
+            try:
+                monitor = winutil.output_rect(self.cfg["screen"])
+                self._pending_toast = (title, body, ok, monitor, fallback)
+                if not winutil.user32.PostMessageW(self.tray.hwnd,
+                                                   winutil.MSG_TOAST, 0, 0):
+                    raise OSError("toast message queue failed")
+            except Exception:
+                log.exception("toast queue failed")
+                if fallback:
+                    self.tray.balloon(title, body)
+        elif fallback:
+            self.tray.balloon(title, body)
+        else:
+            log.warning("notification skipped: %s: %s", title, body)
 
     def open_settings(self):
-        subprocess.Popen([common.pythonw(), str(common.SCRIPT), "--settings"])
+        subprocess.Popen(common.launch_cmd("--settings"))
 
     def reload(self):
         self.cfg = common.load_cfg()
@@ -219,8 +262,22 @@ class App:
             self.tray.destroy()
 
 
+def _minutes_text(minutes):
+    h, m = divmod(int(minutes), 60)
+    if h and m:
+        return f"{h} h {m} min"
+    return f"{h} h" if h else f"{m} min"
+
+
 def run_app():
     common.setup_logging()
+    # run under Povtoritel.exe
+    if (common.EXE.exists() and not common.in_exe()
+            and not os.environ.get("POVTORITEL_RELAUNCH")):
+        log.info("relaunching via %s", common.EXE.name)
+        env = dict(os.environ, POVTORITEL_RELAUNCH="1")
+        subprocess.Popen(common.launch_cmd(), env=env)
+        return
     winutil.set_dpi_aware()
     winutil.kernel32.SetErrorMode(0x8003)
     import time

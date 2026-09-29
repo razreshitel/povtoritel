@@ -1,10 +1,13 @@
 import json
 import logging
+import os
 import sys
 from pathlib import Path
 
 BASE = Path(__file__).resolve().parent
 SCRIPT = BASE / "povtoritel.pyw"
+EXE = BASE / "Povtoritel.exe"
+ICON_APP = BASE / "povtoritel.ico"
 CONFIG_PATH = BASE / "config.json"
 LOG_PATH = BASE / "povtoritel.log"
 FF_LOG = BASE / "ffmpeg.log"
@@ -26,6 +29,7 @@ DEFAULTS = {
     "record_hotkey": {"mods": ["ctrl", "alt"], "vk": 0x4C,
                       "label": "Ctrl+Alt+L"},
     "hold_for_recording": False,
+    "record_reminder_min": 30,
     "folder": str(Path.home() / "Videos" / "Replays"),
     "audio": True,
     "mic": False,
@@ -55,12 +59,25 @@ def save_cfg(cfg):
 
 
 def pythonw():
-    p = Path(sys.executable).with_name("pythonw.exe")
-    return str(p if p.exists() else sys.executable)
+    for p in (Path(sys.executable).with_name("pythonw.exe"),
+              Path(sys.base_prefix) / "pythonw.exe"):
+        if p.exists():
+            return str(p)
+    return sys.executable
+
+
+def in_exe():
+    return os.path.normcase(sys.executable) == os.path.normcase(str(EXE))
+
+
+def launch_cmd(*args):
+    if EXE.exists():
+        return [str(EXE), *args]
+    return [pythonw(), str(SCRIPT), *args]
 
 
 def startup_cmd():
-    return f'"{pythonw()}" "{SCRIPT}"'
+    return " ".join(f'"{a}"' for a in launch_cmd())
 
 
 def find_ffmpeg():
