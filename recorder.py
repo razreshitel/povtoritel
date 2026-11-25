@@ -65,6 +65,14 @@ def _close_pipe(src):
         src["pipe_handle"] = None
 
 
+def _rotate(path, limit=2_000_000):
+    try:
+        if path.exists() and path.stat().st_size > limit:
+            path.replace(path.with_name(path.name + ".old"))
+    except OSError:
+        pass
+
+
 class _FormatChanged(Exception):
     pass
 
@@ -108,6 +116,8 @@ class Recorder:
         self._wake = threading.Event()
         self._restart = False
         self._fails = 0
+        self._quiet = False
+        self._fail_total = 0
         self._warned = set()
         self._pipe_seq = 0
         self.last_data = time.monotonic()
@@ -358,7 +368,8 @@ class Recorder:
                         cap = ncap
                 time.sleep(0.005)
         except (OSError, ValueError) as e:
-            log.warning("%s feed ended: %s", label, e)
+            if not self._quiet:
+                log.warning("%s feed ended: %s", label, e)
         except Exception:
             log.exception("%s feed failed", label)
         finally:
@@ -449,7 +460,8 @@ class Recorder:
                     sent += n
                 time.sleep(0.005)
         except (OSError, ValueError) as e:
-            log.warning("%s feed ended: %s", src["label"], e)
+            if not self._quiet:
+                log.warning("%s feed ended: %s", src["label"], e)
         except Exception:
             log.exception("%s feed failed", src["label"])
         finally:
@@ -558,6 +570,7 @@ class Recorder:
                     _close_pipe(s)
                 self._stop.wait(10)
                 continue
+            _rotate(self.err_log)
             try:
                 errf = open(self.err_log, "ab")
             except OSError:
@@ -595,12 +608,13 @@ class Recorder:
             if slots:
                 threading.Thread(target=self._watch_sessions,
                                  args=(proc, slots, names), daemon=True).start()
-            log.info("capture started: adapter=%s output=%s fps=%s quality=%s"
-                     " audio=%s full_mix=%s app_slots=%s",
-                     self.screen.get("adapter"), self.screen.get("output"),
-                     self.fps, self.quality, self.audio_on,
-                     any(s["track_label"] == "full" for s in srcs),
-                     len(slots))
+            if not self._quiet:
+                log.info("capture started: adapter=%s output=%s fps=%s"
+                         " quality=%s audio=%s full_mix=%s app_slots=%s",
+                         self.screen.get("adapter"), self.screen.get("output"),
+                         self.fps, self.quality, self.audio_on,
+                         any(s["track_label"] == "full" for s in srcs),
+                         len(slots))
             started = time.monotonic()
             self.last_data = started
             while True:
@@ -646,9 +660,24 @@ class Recorder:
             if self._stop.is_set() or self.paused or self._restart:
                 continue
             alive = time.monotonic() - started
-            self._fails = 0 if alive > 60 else min(self._fails + 1, 99)
+            if alive > 60:
+                if self._quiet:
+                    log.info("capture had recovered after %s failed starts",
+                             self._fail_total)
+                self._fails = 0
+                self._fail_total = 0
+                self._quiet = False
+            else:
+                self._fails = min(self._fails + 1, 99)
+                self._fail_total += 1
             wait = min(60, 2 * self._fails) if self._fails else 1
-            log.warning("capture exited rc=%s after %.0fs, retry in %ss", rc, alive, wait)
+            if not self._quiet or self._fail_total % 60 == 0:
+                log.warning("capture exited rc=%s after %.0fs, retry in %ss"
+                            " (failed starts: %s)", rc, alive, wait,
+                            self._fail_total)
+            if self._fails >= 3 and not self._quiet:
+                self._quiet = True
+                log.warning("capture keeps failing; logging every 60th attempt")
             if (self._fails in (3, 8) and self.fail_cb
                     and not winutil.desktop_locked()):
                 try:
@@ -755,7 +784,7 @@ class Recorder:
         log.info("continuous recording started: %s", temp.name)
         return temp
 
-    def stop_recording(self):
+    def _detach_recording(self):
         with self.lock:
             state = self._recording
             if not state:
@@ -764,16 +793,42 @@ class Recorder:
             names = dict(self.slot_names)
             restart_after = self._restart_after_recording
             self._restart_after_recording = False
+            stream = state["file"]
+            state["file"] = None
         if restart_after:
             self.restart()
-        stream = state["file"]
         if stream:
-            stream.close()
+            try:
+                stream.close()
+            except OSError:
+                pass
+        return state, names
+
+    def discard_recording(self):
+        state, _names = self._detach_recording()
+        temp = state["temp"]
+        for _ in range(20):
+            try:
+                temp.unlink(missing_ok=True)
+                break
+            except PermissionError:
+                time.sleep(0.25)
+        else:
+            raise RuntimeError(f"could not delete {temp.name}")
+        dur = max(0.0, state["last"] - state["started"])
+        log.info("continuous recording discarded: %s (%.0f s, %.1f MB)",
+                 temp.name, dur, state["bytes"] / 1e6)
+        return dur
+
+    def stop_recording(self, on_stopped=None):
+        state, names = self._detach_recording()
         if state["error"]:
             log.warning("finalizing interrupted recording: %s", state["error"])
         if state["bytes"] <= 0:
             state["temp"].unlink(missing_ok=True)
             raise RuntimeError("recording contains no video")
+        if on_stopped:
+            on_stopped(max(0.0, state["last"] - state["started"]))
 
         maps = ["-map", "0:v:0"]
         meta = []
@@ -818,7 +873,7 @@ class Recorder:
             return False
         return time.monotonic() - self.last_data > limit
 
-    def save(self, folder):
+    def save(self, folder, on_snapshot=None):
         with self.lock:
             snap = list(self.chunks)
             layout = list(self.layout)
@@ -830,6 +885,8 @@ class Recorder:
         cut = snap[-1][0] - (self.minutes * 60 + SAVE_PAD)
         snap = [c for c in snap if c[0] >= cut]
         dur = snap[-1][0] - snap[0][0]
+        if on_snapshot:
+            on_snapshot(dur)
         maps = ["-map", "0:v:0"]
         meta = []
         kept = []

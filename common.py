@@ -29,7 +29,6 @@ DEFAULTS = {
     "record_hotkey": {"mods": ["ctrl", "alt"], "vk": 0x4C,
                       "label": "Ctrl+Alt+L"},
     "hold_for_recording": False,
-    "record_reminder_min": 30,
     "folder": str(Path.home() / "Videos" / "Replays"),
     "audio": True,
     "mic": False,
@@ -110,6 +109,10 @@ def rotate(path, limit=1_000_000):
 
 
 def setup_logging():
+    import logging.handlers
     rotate(LOG_PATH)
-    logging.basicConfig(filename=str(LOG_PATH), level=logging.INFO,
+    handler = logging.handlers.RotatingFileHandler(
+        str(LOG_PATH), maxBytes=1_000_000, backupCount=1, encoding="utf-8")
+    handler.namer = lambda name: name[:-2] + ".old" if name.endswith(".1") else name
+    logging.basicConfig(level=logging.INFO, handlers=[handler],
                         format="%(asctime)s %(levelname)s %(message)s")

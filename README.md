@@ -35,9 +35,14 @@ creates its configuration, tray icons, and autostart entry.
 - The replay hotkey saves the configured number of recent minutes.
 - The recording hotkey starts or stops continuous recording.
 - Continuous recording can instead use a two-second hold of the replay hotkey.
-- During continuous recording, a reminder appears every 30 minutes
-  (`record_reminder_min` in `config.json`, 0 disables it). Like other
-  notifications, it is excluded from the recording.
+- During continuous recording, a small red corner mark (4x4 px L shape,
+  2 px thick) stays in the top-right corner of the captured screen. It is
+  excluded from the recording and from screen sharing.
+- While continuous recording is active, the tray menu offers "Delete
+  recording without saving": after confirmation it stops the recording and
+  deletes its temporary file.
+- Stopping a recording or saving a replay shows a notification at once; a
+  second notification with the file size follows when the file is written.
 - Additional held Shift, Ctrl, or Alt keys do not prevent a configured hotkey
   from working. If replay and recording combinations overlap, recording takes
   priority and only one action is performed.

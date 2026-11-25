@@ -1,3 +1,4 @@
+import collections
 import logging
 import os
 import subprocess
@@ -13,7 +14,9 @@ from recorder import Recorder
 
 log = logging.getLogger("povtoritel")
 
-MENU_SAVE, MENU_RECORD, MENU_PAUSE, MENU_FOLDER, MENU_SETTINGS, MENU_AUTOSTART, MENU_QUIT = range(1, 8)
+(MENU_SAVE, MENU_RECORD, MENU_PAUSE, MENU_FOLDER, MENU_SETTINGS,
+ MENU_AUTOSTART, MENU_QUIT, MENU_DISCARD) = range(1, 9)
+INDICATOR_EXCLUDED = True
 
 
 class App:
@@ -25,14 +28,18 @@ class App:
         self.busy = threading.Lock()
         self.record_busy = threading.Lock()
         self.ticks = 0
-        self._reminded = 0
-        self._pending_toast = None
+        self._toasts = collections.deque()
         self.tray = winutil.Tray(self._tip(), common.ICON_ACTIVE, self.handle)
         try:
             self.toast = winutil.Toast()
         except Exception:
             log.exception("toast init failed")
             self.toast = None
+        try:
+            self.indicator = winutil.Indicator(excluded=INDICATOR_EXCLUDED)
+        except Exception:
+            log.exception("indicator init failed")
+            self.indicator = None
         self._register_hotkeys()
         self.recorder.start()
         self.tray.start_timer(60000)
@@ -56,6 +63,15 @@ class App:
             icon = common.ICON_ACTIVE
         self.tray.set_icon(icon)
         self.tray.set_tip(self._tip())
+        winutil.user32.PostMessageW(self.tray.hwnd, winutil.MSG_INDICATOR, 0, 0)
+
+    def _sync_indicator(self):
+        if not self.indicator:
+            return
+        if self.recorder.recording():
+            self.indicator.show(winutil.output_rect(self.cfg["screen"]))
+        else:
+            self.indicator.hide()
 
     def handle(self, kind, _data):
         if kind == "save":
@@ -69,10 +85,14 @@ class App:
         elif kind == "reload":
             self.reload()
         elif kind == "toast":
-            if self.toast and self._pending_toast:
-                title, body, ok, monitor, fallback = self._pending_toast
+            try:
+                item = self._toasts.popleft()
+            except IndexError:
+                item = None
+            if self.toast and item:
+                title, body, ok, monitor, fallback, hold = item
                 try:
-                    shown = self.toast.show(title, body, ok, monitor)
+                    shown = self.toast.show(title, body, ok, monitor, hold)
                 except Exception:
                     log.exception("toast display failed")
                     shown = False
@@ -80,6 +100,8 @@ class App:
                     self.tray.balloon(title, body)
                 elif not shown:
                     log.warning("toast not shown: %s", title)
+        elif kind == "indicator":
+            self._sync_indicator()
         elif kind == "timer":
             if self.recorder.stalled():
                 log.warning("capture stalled, restarting")
@@ -89,7 +111,6 @@ class App:
             if self.ticks % 5 == 0:
                 secs, size = self.recorder.buffered()
                 log.info("buffer: %.0fs, %.1f MB", secs, size / 1e6)
-            self._remind_recording()
         elif kind == "quit":
             self.quit()
 
@@ -105,6 +126,11 @@ class App:
             (MENU_SAVE, f"Save replay now ({self.cfg['hotkey']['label']})",
              False, True),
             (MENU_RECORD, record_label, recording, True),
+        ]
+        if recording:
+            items.append((MENU_DISCARD, "Delete recording without saving",
+                          False, True))
+        items += [
             (MENU_PAUSE, "Resume buffering" if paused else "Pause buffering",
              False, not recording),
             None,
@@ -120,6 +146,8 @@ class App:
             self.save_async()
         elif cmd == MENU_RECORD:
             self.toggle_recording()
+        elif cmd == MENU_DISCARD:
+            self.discard_recording()
         elif cmd == MENU_PAUSE:
             if paused:
                 self.recorder.resume()
@@ -149,8 +177,12 @@ class App:
 
     def _save_job(self):
         try:
-            out, dur, size = self.recorder.save(self.cfg["folder"])
-            self._notify("Replay saved", f"{dur:.0f}s  -  {size / 1e6:.0f} MB", True)
+            out, dur, size = self.recorder.save(
+                self.cfg["folder"],
+                on_snapshot=lambda d: self._notify(
+                    "Replay saved", _dur_text(d), True))
+            self._notify("Replay file ready",
+                         f"{_dur_text(dur)}  -  {_size_text(size)}", True)
         except Exception as e:
             log.exception("save failed")
             self._notify("Save failed", str(e)[:60], False)
@@ -165,12 +197,12 @@ class App:
     def _record_job(self):
         try:
             if self.recorder.recording():
-                out, dur, size = self.recorder.stop_recording()
+                out, dur, size = self.recorder.stop_recording(
+                    on_stopped=self._recording_stopped)
                 self._notify("Recording saved",
-                             f"{dur:.0f}s  -  {size / 1e6:.0f} MB", True)
+                             f"{_dur_text(dur)}  -  {_size_text(size)}", True)
             else:
                 self.recorder.start_recording(self.cfg["folder"])
-                self._reminded = 0
                 self._notify("Recording started", "Press the hotkey again to stop", True)
         except Exception as e:
             log.exception("continuous recording failed")
@@ -179,35 +211,46 @@ class App:
             self.record_busy.release()
             self._update_tray()
 
-    def _remind_recording(self):
-        try:
-            every = float(self.cfg.get("record_reminder_min", 30)) * 60
-        except (TypeError, ValueError):
-            every = 30 * 60
-        active, dur, _size = self.recorder.recording_status()
-        if not active or every <= 0:
-            self._reminded = 0
-            return
-        due = int(dur // every)
-        if due <= self._reminded:
-            return
-        self._reminded = due
-        elapsed = _minutes_text(round(due * every / 60))
-        if self.cfg.get("hold_for_recording", False):
-            hint = f"Hold {self.cfg['hotkey']['label']} for 2s to stop"
-        else:
-            hint = f"Press {self.cfg['record_hotkey']['label']} to stop"
-        log.info("recording reminder: %s", elapsed)
-        # balloons would be captured
-        self._notify(f"Still recording: {elapsed}", hint, True, fallback=False)
+    def _recording_stopped(self, dur):
+        self._notify("Recording stopped", f"{_dur_text(dur)}, writing file...",
+                     True)
+        self._update_tray()
 
-    def _notify(self, title, body, ok, fallback=True):
+    def discard_recording(self):
+        if not self.recorder.recording():
+            return
+        _active, dur, size = self.recorder.recording_status()
+        answer = winutil.user32.MessageBoxW(
+            self.tray.hwnd,
+            f"Delete the current recording ({_dur_text(dur)},"
+            f" {_size_text(size)})?\nIt will not be saved.",
+            "Povtoritel", 0x4 | 0x30 | 0x100 | 0x10000 | 0x40000)
+        if answer != 6:  # IDYES
+            return
+        if not self.record_busy.acquire(blocking=False):
+            return
+        threading.Thread(target=self._discard_job, daemon=True).start()
+
+    def _discard_job(self):
+        try:
+            dur = self.recorder.discard_recording()
+            self._notify("Recording deleted", f"{_dur_text(dur)} discarded", True)
+        except Exception as e:
+            log.exception("discard recording failed")
+            self._notify("Delete failed", str(e)[:80], False)
+        finally:
+            self.record_busy.release()
+            self._update_tray()
+
+
+    def _notify(self, title, body, ok, fallback=True, hold=1800):
         if self.toast and (fallback or self.toast.excluded):
             try:
                 monitor = winutil.output_rect(self.cfg["screen"])
-                self._pending_toast = (title, body, ok, monitor, fallback)
+                self._toasts.append((title, body, ok, monitor, fallback, hold))
                 if not winutil.user32.PostMessageW(self.tray.hwnd,
                                                    winutil.MSG_TOAST, 0, 0):
+                    self._toasts.pop()
                     raise OSError("toast message queue failed")
             except Exception:
                 log.exception("toast queue failed")
@@ -262,11 +305,17 @@ class App:
             self.tray.destroy()
 
 
-def _minutes_text(minutes):
-    h, m = divmod(int(minutes), 60)
-    if h and m:
+def _dur_text(sec):
+    h, rem = divmod(int(round(sec)), 3600)
+    m, s = divmod(rem, 60)
+    if h:
         return f"{h} h {m} min"
-    return f"{h} h" if h else f"{m} min"
+    return f"{m} min {s} s" if m else f"{s} s"
+
+
+def _size_text(size):
+    return f"{size / 1e9:.2f} GB" if size >= 1e9 else f"{size / 1e6:.0f} MB"
+
 
 
 def run_app():

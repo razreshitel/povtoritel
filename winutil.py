@@ -32,6 +32,7 @@ MSG_QUIT = WM_APP + 3
 MSG_SETTINGS = WM_APP + 4
 MSG_TOAST = WM_APP + 5
 MSG_HOTKEY_ACTION = WM_APP + 6
+MSG_INDICATOR = WM_APP + 7
 MSG_TRAY = WM_APP + 10
 WM_PAINT = 0x000F
 
@@ -165,7 +166,8 @@ kernel32.GetExitCodeProcess.argtypes = [wt.HANDLE, ctypes.POINTER(wt.DWORD)]
 def pid_alive(pid):
     h = kernel32.OpenProcess(0x1000, False, pid)
     if not h:
-        return False
+        # access denied = exists
+        return kernel32.GetLastError() == 5
     code = wt.DWORD()
     kernel32.GetExitCodeProcess(h, ctypes.byref(code))
     kernel32.CloseHandle(h)
@@ -584,6 +586,9 @@ class Tray:
             if msg == MSG_TOAST:
                 self.handler("toast", None)
                 return 0
+            if msg == MSG_INDICATOR:
+                self.handler("indicator", None)
+                return 0
             if msg == self._taskbar_msg:
                 self._add_icon()
                 return 0
@@ -637,6 +642,10 @@ gdi32.CreateSolidBrush.restype = wt.HBRUSH
 gdi32.CreateSolidBrush.argtypes = [wt.COLORREF]
 gdi32.CreateRoundRectRgn.restype = wt.HRGN
 gdi32.CreateRoundRectRgn.argtypes = [ctypes.c_int] * 6
+gdi32.CreateRectRgn.restype = wt.HRGN
+gdi32.CreateRectRgn.argtypes = [ctypes.c_int] * 4
+gdi32.CombineRgn.argtypes = [wt.HRGN, wt.HRGN, wt.HRGN, ctypes.c_int]
+gdi32.DeleteObject.argtypes = [wt.HGDIOBJ]
 gdi32.CreateFontW.restype = wt.HFONT
 gdi32.SelectObject.restype = wt.HGDIOBJ
 gdi32.SelectObject.argtypes = [wt.HDC, wt.HGDIOBJ]
@@ -650,6 +659,66 @@ gdi32.Ellipse.argtypes = [wt.HDC, ctypes.c_int, ctypes.c_int,
 
 def _rgb(r, g, b):
     return r | (g << 8) | (b << 16)
+
+
+INDICATOR_CLASS = "PovtoritelIndicator"
+
+
+class Indicator:
+    """Red corner pixels."""
+
+    def __init__(self, arm=4, thick=2, excluded=True):
+        self.W = self.H = arm
+        self.visible = False
+        hinst = kernel32.GetModuleHandleW(None)
+        self._proc = WNDPROC(self._wndproc)
+        wc = WNDCLASSW()
+        wc.lpfnWndProc = self._proc
+        wc.hInstance = hinst
+        wc.hbrBackground = gdi32.CreateSolidBrush(_rgb(255, 0, 0))
+        wc.lpszClassName = INDICATOR_CLASS
+        user32.RegisterClassW(ctypes.byref(wc))
+        exstyle = 0x80000 | 0x8 | 0x80 | 0x8000000 | 0x20
+        self.hwnd = user32.CreateWindowExW(exstyle, INDICATOR_CLASS, "", 0x80000000,
+                                           0, 0, self.W, self.H,
+                                           None, None, hinst, None)
+        # corner L shape
+        rgn = gdi32.CreateRectRgn(0, 0, arm, thick)
+        side = gdi32.CreateRectRgn(arm - thick, 0, arm, arm)
+        gdi32.CombineRgn(rgn, rgn, side, 2)  # RGN_OR
+        gdi32.DeleteObject(side)
+        user32.SetWindowRgn(self.hwnd, rgn, False)
+        user32.SetLayeredWindowAttributes(self.hwnd, 0, 255, 0x2)
+        self.excluded = bool(excluded and user32.SetWindowDisplayAffinity(
+            self.hwnd, 0x11))
+
+    def show(self, monitor=None):
+        if monitor:
+            _left, top, right, _bottom = monitor
+        else:
+            right, top = user32.GetSystemMetrics(0), 0
+        user32.SetWindowPos(self.hwnd, -1, right - self.W, top, self.W, self.H,
+                            0x10 | 0x40)
+        if not self.visible:
+            self.visible = True
+            # keep above fullscreen
+            user32.SetTimer(self.hwnd, 1, 500, None)
+
+    def hide(self):
+        if self.visible:
+            self.visible = False
+            user32.KillTimer(self.hwnd, 1)
+            user32.ShowWindow(self.hwnd, 0)
+
+    def _wndproc(self, hwnd, msg, wp, lp):
+        try:
+            if msg == WM_TIMER and wp == 1:
+                user32.SetWindowPos(hwnd, -1, 0, 0, 0, 0, 0x53)
+                return 0
+        except Exception:
+            log.exception("indicator wndproc error")
+            return 0
+        return user32.DefWindowProcW(hwnd, msg, wp, lp)
 
 
 TOAST_CLASS = "PovtoritelToast"
@@ -708,7 +777,7 @@ class Toast:
         return gdi32.CreateFontW(-px, 0, 0, 0, weight, 0, 0, 0, 1, 0, 0, 5, 0,
                                  "Segoe UI")
 
-    def show(self, title, body, ok=True, monitor=None):
+    def show(self, title, body, ok=True, monitor=None, hold_ms=1800):
         if not self.hwnd:
             return False
         self._title = title
@@ -727,7 +796,7 @@ class Toast:
         shown = user32.SetWindowPos(self.hwnd, -1, x, top + self.M, self.W, self.H,
                                     0x10 | 0x40)
         user32.InvalidateRect(self.hwnd, None, True)
-        user32.SetTimer(self.hwnd, 1, 1800, None)
+        user32.SetTimer(self.hwnd, 1, int(hold_ms), None)
         # keep above fullscreen
         user32.SetTimer(self.hwnd, 3, 250, None)
         return bool(shown and user32.IsWindowVisible(self.hwnd))
