@@ -168,14 +168,6 @@ class SettingsWin:
                   foreground="#777777").grid(row=10, column=1, columnspan=2,
                                              sticky="w")
 
-        ttk.Label(frm, text="Ignore apps:").grid(row=11, column=0, sticky="w",
-                                                 padx=(0, 10), pady=4)
-        self.exclude = tk.StringVar(value=", ".join(cfg.get("app_exclude", [])))
-        ttk.Entry(frm, textvariable=self.exclude, width=34).grid(
-            row=11, column=1, sticky="w", pady=4)
-        ttk.Label(frm, text="exe names, comma separated",
-                  foreground="#777777").grid(row=11, column=2, sticky="w", padx=6)
-
         self.priority = tk.BooleanVar(value=bool(cfg.get("capture_priority", False)))
         ttk.Checkbutton(frm, text="High capture priority (smoother under GPU load)",
                         variable=self.priority).grid(row=12, column=1,
@@ -303,14 +295,6 @@ class SettingsWin:
         idx = self.mic_box.current()
         self.cfg["mic_device"] = "" if idx <= 0 else self.mics[idx - 1]["id"]
         self.cfg["app_auto"] = bool(self.app_auto.get())
-        exclude = []
-        for name in self.exclude.get().split(","):
-            name = name.strip().lower()
-            if name and not name.endswith(".exe"):
-                name += ".exe"
-            if name and name not in exclude:
-                exclude.append(name)
-        self.cfg["app_exclude"] = exclude
         self.cfg["capture_priority"] = bool(self.priority.get())
         self.cfg["autostart"] = bool(self.autostart.get())
         common.save_cfg(self.cfg)

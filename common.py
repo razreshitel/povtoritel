@@ -33,7 +33,6 @@ DEFAULTS = {
     "mic_device": "",
     "app_auto": True,
     "app_slots": 6,
-    "app_exclude": ["picomicdrainer.exe"],
     "audio_offset_ms": 0,
     "capture_priority": False,
     "autostart": True,

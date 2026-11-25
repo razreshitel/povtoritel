@@ -89,8 +89,6 @@ Launching the application while it is already running opens Settings.
   and another application plays sound, the slot that has been silent longer
   than the buffer is reassigned (never during a long recording). Sound that
   gets no slot stays in the Full/Desktop track.
-- "Ignore apps" in Settings (`app_exclude`) lists executables that never get
-  their own track; `picomicdrainer.exe` is ignored by default.
 - The RAM buffer is cleared when capture restarts.
 - `povtoritel.log` rotates at 1 MB and `ffmpeg.log` at 2 MB (one `.old` copy
   each).

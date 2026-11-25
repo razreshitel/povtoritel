@@ -158,7 +158,6 @@ class Recorder:
         self._restart_after_recording = False
         self._run_id = 0
         self._last_binds = {}
-        self.exclude = set()
 
     def configure(self, cfg):
         restart = (dict(cfg["screen"]) != self.screen
@@ -182,7 +181,6 @@ class Recorder:
         self.app_slots = max(1, min(10, int(cfg.get("app_slots", 6))))
         self.priority = bool(cfg.get("capture_priority", False))
         self.offset_ms = int(cfg.get("audio_offset_ms", 0))
-        self.exclude = {str(x).lower() for x in cfg.get("app_exclude", [])}
         if restart and self.thread and not self.paused:
             if self.recording():
                 self._restart_after_recording = True
@@ -524,21 +522,20 @@ class Recorder:
         bound = {s["bind"]["exe"] for s in slots if s.get("bind")}
         free = sum(1 for s in slots if not s.get("bind"))
         window = self.minutes * 60 + KEEP_PAD
-        drop = [s for s in slots
-                if s.get("bind") and s["bind"]["exe"] in self.exclude]
-        need = sum(1 for exe in active if exe not in bound) - free - len(drop)
+        need = sum(1 for exe in active if exe not in bound) - free
+        if need <= 0:
+            return
         cands = []
         for s in slots:
             b = s.get("bind")
-            if not b or b["exe"] in self.exclude:
+            if not b:
                 continue
             dq = s["acts"][s["label"]]
             last = max(dq[-1] if dq else 0.0, b.get("t", 0.0))
             if now - last > window:
                 cands.append((b["exe"] in active, last, s))
         cands.sort(key=lambda c: (c[0], c[1]))
-        drop += [c[2] for c in cands[:max(0, need)]]
-        for s in drop:
+        for _active, _last, s in cands[:need]:
             exe = s["bind"]["exe"]
             with self.lock:
                 s["bind"] = None
@@ -563,8 +560,7 @@ class Recorder:
                 if is_sys or state != 1 or pid in (0, 4, me):
                     continue
                 exe = exe_by_pid.get(pid)
-                if (not exe or exe in ("audiodg.exe", "ffmpeg.exe")
-                        or exe in self.exclude):
+                if not exe or exe in ("audiodg.exe", "ffmpeg.exe"):
                     continue
                 active.setdefault(exe, pid)
             self._release_slots(slots, names, active, now)
@@ -630,7 +626,7 @@ class Recorder:
                     layout.append((label, s["track_title"]))
                     activity[label] = s["acts"][label]
                 exe = self._last_binds.get(s["label"])
-                if s["kind"] == "slot" and exe and exe not in self.exclude:
+                if s["kind"] == "slot" and exe:
                     s["bind"] = {"exe": exe, "pid": None, "t": bind_t}
                     names[s["label"]] = _stem(exe)
             self._run_id += 1
