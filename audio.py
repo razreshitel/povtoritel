@@ -1,6 +1,7 @@
 import ctypes
 import logging
 import threading
+import time
 
 log = logging.getLogger("povtoritel")
 
@@ -210,6 +211,16 @@ def _guid_eq(a, b):
 
 
 _keepalive = []
+_keep_lock = threading.Lock()
+
+
+def _keep(entry):
+    now = time.monotonic()
+    with _keep_lock:
+        # completed handlers expire
+        _keepalive[:] = [k for k in _keepalive
+                         if not (k[2].is_set() and now - k[3] > 60)]
+        _keepalive.append(entry)
 
 
 def _activate_process_client(pid):
@@ -231,7 +242,7 @@ def _activate_process_client(pid):
     vtbl = _HandlerVtbl(_QI_T(qi), _REF_T(lambda t: 2), _REF_T(lambda t: 1),
                         _DONE_T(completed))
     obj = _HandlerObj(ctypes.pointer(vtbl))
-    _keepalive.append((vtbl, obj))
+    _keep((vtbl, obj, done, time.monotonic()))
     params = _ActivationParams(1, _ProcLoopbackParams(pid, 0))
     pv = _PropVariantBlob(VT_BLOB, 0, 0, 0, ctypes.sizeof(params),
                           ctypes.cast(ctypes.byref(params), ctypes.c_void_p))

@@ -3,9 +3,11 @@ import collections
 import ctypes
 import ctypes.wintypes as wt
 import datetime
+import json
 import logging
 import msvcrt
 import os
+import queue
 import subprocess
 import threading
 import time
@@ -73,6 +75,36 @@ def _rotate(path, limit=2_000_000):
         pass
 
 
+def _write_json(path, data):
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        tmp.write_text(json.dumps(data), "utf-8")
+        os.replace(tmp, path)
+    except OSError as e:
+        log.warning("recording metadata write failed: %s", e)
+
+
+def _free_name(path):
+    if not path.exists():
+        return path
+    for i in range(2, 1000):
+        cand = path.with_name(f"{path.stem}_{i}{path.suffix}")
+        if not cand.exists():
+            return cand
+    return path
+
+
+def _concat_list(path, files):
+    lines = []
+    for f in files:
+        lines.append("file '" + str(f).replace("'", "'\\''") + "'")
+    path.write_text("\n".join(lines) + "\n", "utf-8")
+
+
+def _stem(exe):
+    return exe[:-4] if exe.endswith(".exe") else exe
+
+
 class _FormatChanged(Exception):
     pass
 
@@ -124,6 +156,9 @@ class Recorder:
         self.thread = None
         self._recording = None
         self._restart_after_recording = False
+        self._run_id = 0
+        self._last_binds = {}
+        self.exclude = set()
 
     def configure(self, cfg):
         restart = (dict(cfg["screen"]) != self.screen
@@ -147,6 +182,7 @@ class Recorder:
         self.app_slots = max(1, min(10, int(cfg.get("app_slots", 6))))
         self.priority = bool(cfg.get("capture_priority", False))
         self.offset_ms = int(cfg.get("audio_offset_ms", 0))
+        self.exclude = {str(x).lower() for x in cfg.get("app_exclude", [])}
         if restart and self.thread and not self.paused:
             if self.recording():
                 self._restart_after_recording = True
@@ -269,8 +305,9 @@ class Recorder:
                     dq.popleft()
         if marked:
             with self.lock:
-                if self._recording:
-                    self._recording["active"].update(marked)
+                rec = self._recording
+                if rec and rec["cur"] is not None:
+                    rec["cur"]["active"].update(marked)
 
     def _sink_for(self, proc, src):
         ok = kernel32.ConnectNamedPipe(src["pipe_handle"], None)
@@ -399,6 +436,7 @@ class Recorder:
         cap = None
         sink = None
         pid = None
+        attached = None
         rate, block = 48000, 8
         try:
             sink = self._sink_for(proc, src)
@@ -414,10 +452,14 @@ class Recorder:
                 now = time.monotonic()
                 bind = src.get("bind")
                 want = bind.get("pid") if bind else None
+                if cap and (bind is not attached or want != pid):
+                    cap = self._drop(cap)
+                    log.info("%s detached from pid %s", src["label"], pid)
                 if cap is None and want:
                     try:
                         cap = audio.Capture(process_pid=want)
                         pid = want
+                        attached = bind
                         next_check = now + 5
                         log.info("track '%s' attached: pid=%s",
                                  bind.get("exe"), want)
@@ -476,6 +518,33 @@ class Recorder:
                 except (OSError, ValueError):
                     pass
 
+    def _release_slots(self, slots, names, active, now):
+        if self.recording():
+            return
+        bound = {s["bind"]["exe"] for s in slots if s.get("bind")}
+        free = sum(1 for s in slots if not s.get("bind"))
+        window = self.minutes * 60 + KEEP_PAD
+        drop = [s for s in slots
+                if s.get("bind") and s["bind"]["exe"] in self.exclude]
+        need = sum(1 for exe in active if exe not in bound) - free - len(drop)
+        cands = []
+        for s in slots:
+            b = s.get("bind")
+            if not b or b["exe"] in self.exclude:
+                continue
+            dq = s["acts"][s["label"]]
+            last = max(dq[-1] if dq else 0.0, b.get("t", 0.0))
+            if now - last > window:
+                cands.append((b["exe"] in active, last, s))
+        cands.sort(key=lambda c: (c[0], c[1]))
+        drop += [c[2] for c in cands[:max(0, need)]]
+        for s in drop:
+            exe = s["bind"]["exe"]
+            with self.lock:
+                s["bind"] = None
+                names.pop(s["label"], None)
+            log.info("%s released from %s", s["label"], exe)
+
     def _watch_sessions(self, proc, slots, names):
         audio.com_init()
         me = os.getpid()
@@ -487,15 +556,18 @@ class Recorder:
                 if self._stop.wait(3):
                     return
                 continue
+            now = time.monotonic()
             exe_by_pid = {p: x for p, _pp, x in procs}
             active = {}
             for pid, state, is_sys in sessions:
                 if is_sys or state != 1 or pid in (0, 4, me):
                     continue
                 exe = exe_by_pid.get(pid)
-                if not exe or exe in ("audiodg.exe", "ffmpeg.exe"):
+                if (not exe or exe in ("audiodg.exe", "ffmpeg.exe")
+                        or exe in self.exclude):
                     continue
                 active.setdefault(exe, pid)
+            self._release_slots(slots, names, active, now)
             by_exe = {}
             for s in slots:
                 b = s.get("bind")
@@ -512,9 +584,11 @@ class Recorder:
                                         " (audio stays in Desktop mix)", exe)
                         continue
                     root, _exe = winutil.find_audio_root([exe])
-                    s["bind"] = {"exe": exe, "pid": root or sess_pid}
-                    stem = exe[:-4] if exe.endswith(".exe") else exe
-                    names[s["label"]] = stem
+                    with self.lock:
+                        s["bind"] = {"exe": exe, "pid": root or sess_pid,
+                                     "t": now}
+                        names[s["label"]] = _stem(exe)
+                    self._overflow.discard(exe)
                     log.info("%s -> %s", s["label"], exe)
                 else:
                     b = s["bind"]
@@ -549,11 +623,18 @@ class Recorder:
             names = {}
             layout = []
             activity = {}
+            bind_t = time.monotonic()
             for s in srcs:
                 label = s["track_label"]
                 if label not in activity:
                     layout.append((label, s["track_title"]))
                     activity[label] = s["acts"][label]
+                exe = self._last_binds.get(s["label"])
+                if s["kind"] == "slot" and exe and exe not in self.exclude:
+                    s["bind"] = {"exe": exe, "pid": None, "t": bind_t}
+                    names[s["label"]] = _stem(exe)
+            self._run_id += 1
+            run_id = self._run_id
             with self.lock:
                 self.chunks.clear()
                 self.total = 0
@@ -629,20 +710,17 @@ class Recorder:
                 with self.lock:
                     self.chunks.append((now, data))
                     self.total += len(data)
-                    recording = self._recording
-                    if recording and recording["file"]:
-                        try:
-                            recording["file"].write(data)
-                            recording["bytes"] += len(data)
-                            recording["last"] = now
-                        except OSError as e:
-                            recording["error"] = str(e)
-                            try:
-                                recording["file"].close()
-                            except OSError:
-                                pass
-                            recording["file"] = None
-                            log.exception("continuous recording write failed")
+                    rec = self._recording
+                    if rec:
+                        seg = rec["cur"]
+                        if seg is None and rec["run"] != run_id:
+                            seg = self._new_segment_locked(rec)
+                        if seg is not None:
+                            rec["q"].put(("data", seg, data))
+                            seg["bytes"] += len(data)
+                            if seg["t0"] is None:
+                                seg["t0"] = now
+                            seg["t1"] = now
                     keep = self.minutes * 60 + KEEP_PAD
                     while self.chunks and self.chunks[0][0] < now - keep:
                         self.total -= len(self.chunks.popleft()[1])
@@ -657,6 +735,8 @@ class Recorder:
                 _poke_pipe(s["pipe_name"])
             for th in feeders:
                 th.join(2)
+            self._last_binds = {s["label"]: s["bind"]["exe"]
+                                for s in slots if s.get("bind")}
             if self._stop.is_set() or self.paused or self._restart:
                 continue
             alive = time.monotonic() - started
@@ -686,7 +766,7 @@ class Recorder:
                     pass
             self._stop.wait(wait)
 
-    def _kill(self):
+    def _kill(self, timeout=3):
         p = self.proc
         if not p:
             return
@@ -696,7 +776,7 @@ class Recorder:
         except (OSError, ValueError, AttributeError):
             pass
         try:
-            p.wait(3)
+            p.wait(timeout)
             return
         except subprocess.TimeoutExpired:
             log.warning("graceful quit timed out, killing")
@@ -705,51 +785,132 @@ class Recorder:
         except OSError:
             pass
 
+    def _kill_async(self):
+        threading.Thread(target=self._kill, daemon=True).start()
+
     def _interrupt_recording(self, reason):
         with self.lock:
-            recording = self._recording
-            if not recording or not recording["file"]:
+            rec = self._recording
+            if not rec or rec["cur"] is None:
                 return
-            recording["error"] = reason
-            try:
-                recording["file"].close()
-            except OSError:
-                pass
-            recording["file"] = None
+            rec["q"].put(("close", rec["cur"]))
+            rec["cur"] = None
+            n = len(rec["segments"])
+        log.info("recording segment %s closed: %s", n, reason)
 
     def restart(self):
         self._interrupt_recording("capture restarted")
         self._restart = True
-        self._kill()
+        self._kill_async()
 
     def pause(self):
         self._interrupt_recording("capture paused")
         self.paused = True
-        self._kill()
+        self._kill_async()
 
     def resume(self):
         self.paused = False
         self._wake.set()
 
-    def stop(self):
+    def stop(self, timeout=3):
         self._interrupt_recording("recorder stopped")
         self._stop.set()
         self.paused = False
         self._wake.set()
-        self._kill()
+        self._kill(timeout)
         if self.thread:
-            self.thread.join(5)
+            self.thread.join(timeout + 2)
 
     def recording(self):
         with self.lock:
             return self._recording is not None
 
+    @staticmethod
+    def _rec_totals(rec):
+        dur = sum(s["t1"] - s["t0"] for s in rec["segments"] if s["t0"] is not None)
+        return dur, sum(s["bytes"] for s in rec["segments"])
+
     def recording_status(self):
         with self.lock:
             if not self._recording:
                 return False, 0.0, 0
-            state = self._recording
-            return True, max(0.0, state["last"] - state["started"]), state["bytes"]
+            dur, size = self._rec_totals(self._recording)
+            return True, dur, size
+
+    def _new_segment_locked(self, rec):
+        idx = len(rec["segments"])
+        base = rec["base"]
+        path = base if idx == 0 else base.with_name(f"{base.stem}.seg{idx + 1}.ts")
+        seg = {"path": path, "layout": list(self.layout),
+               "names": self.slot_names, "active": set(), "bytes": 0,
+               "t0": None, "t1": None}
+        rec["segments"].append(seg)
+        rec["cur"] = seg
+        rec["run"] = self._run_id
+        if idx:
+            log.info("recording continues in segment %s", idx + 1)
+        return seg
+
+    @staticmethod
+    def _meta_locked(rec):
+        segs = []
+        for s in rec["segments"]:
+            if s["bytes"] <= 0:
+                continue
+            segs.append({"path": str(s["path"]), "layout": s["layout"],
+                         "names": dict(s["names"]),
+                         "active": sorted(s["active"]),
+                         "dur": s["t1"] - s["t0"]})
+        return {"out": str(rec["out"]), "segments": segs}
+
+    def _writer(self, rec):
+        f = None
+        fseg = None
+        while True:
+            item = rec["q"].get()
+            kind = item[0]
+            if kind == "data":
+                seg = item[1]
+                if seg is not fseg:
+                    f = self._close_file(f)
+                    fseg = seg
+                    if "failed" not in seg:
+                        try:
+                            f = open(seg["path"], "xb", buffering=1 << 20)
+                        except OSError as e:
+                            seg["failed"] = str(e)
+                            log.error("recording segment open failed: %s", e)
+                if f:
+                    try:
+                        f.write(item[2])
+                    except OSError as e:
+                        seg["failed"] = str(e)
+                        log.error("recording write failed: %s", e)
+                        f = self._close_file(f)
+            elif kind == "close":
+                if item[1] is fseg:
+                    f = self._close_file(f)
+                    fseg = None
+            elif kind == "meta":
+                _write_json(rec["meta_path"], item[1])
+            elif kind == "stop":
+                self._close_file(f)
+                return
+
+    @staticmethod
+    def _close_file(f):
+        if f:
+            try:
+                f.close()
+            except OSError as e:
+                log.error("recording segment close failed: %s", e)
+        return None
+
+    def checkpoint(self):
+        with self.lock:
+            rec = self._recording
+            if rec:
+                rec["q"].put(("meta", self._meta_locked(rec)))
 
     def start_recording(self, folder):
         folder = Path(folder)
@@ -758,109 +919,219 @@ class Recorder:
         suffix = ""
         index = 1
         while True:
-            temp = folder / f".recording_{stamp}_{os.getpid()}{suffix}.ts"
+            base = folder / f".recording_{stamp}_{os.getpid()}{suffix}.ts"
             out = folder / f"recording_{stamp}{suffix}.mp4"
-            if not temp.exists() and not out.exists():
+            if not base.exists() and not out.exists():
                 break
             suffix = f"_{index}"
             index += 1
-        stream = open(temp, "xb", buffering=0)
-        now = time.monotonic()
+        rec = {"base": base, "out": out, "meta_path": base.with_suffix(".json"),
+               "q": queue.Queue(), "segments": [], "cur": None, "run": None}
         with self.lock:
             if self._recording:
-                stream.close()
-                temp.unlink(missing_ok=True)
                 raise RuntimeError("recording already active")
             proc = self.proc
             if self.paused or proc is None or proc.poll() is not None:
-                stream.close()
-                temp.unlink(missing_ok=True)
                 raise RuntimeError("capture is not running")
-            self._recording = {
-                "file": stream, "temp": temp, "out": out,
-                "started": now, "last": now, "bytes": 0,
-                "layout": list(self.layout), "active": set(), "error": None,
-            }
-        log.info("continuous recording started: %s", temp.name)
-        return temp
+            self._new_segment_locked(rec)
+            self._recording = rec
+        rec["writer"] = threading.Thread(target=self._writer, args=(rec,),
+                                         daemon=True)
+        rec["writer"].start()
+        log.info("continuous recording started: %s", base.name)
+        return base
 
-    def _detach_recording(self):
+    def detach_recording(self, keep_files=False):
         with self.lock:
-            state = self._recording
-            if not state:
+            rec = self._recording
+            if not rec:
                 raise RuntimeError("recording is not active")
             self._recording = None
-            names = dict(self.slot_names)
             restart_after = self._restart_after_recording
             self._restart_after_recording = False
-            stream = state["file"]
-            state["file"] = None
-        if restart_after:
+            if rec["cur"] is not None:
+                rec["q"].put(("close", rec["cur"]))
+                rec["cur"] = None
+            rec["meta"] = self._meta_locked(rec)
+            rec["q"].put(("meta", rec["meta"]))
+            rec["q"].put(("stop",))
+        if restart_after and not keep_files:
             self.restart()
-        if stream:
-            try:
-                stream.close()
-            except OSError:
-                pass
-        return state, names
+        rec["writer"].join(4 if keep_files else None)
+        dur, _size = self._rec_totals(rec)
+        return rec, dur
+
+    def shutdown_recording(self):
+        try:
+            rec, dur = self.detach_recording(keep_files=True)
+        except RuntimeError:
+            return
+        log.info("recording kept for recovery on shutdown (%.0f s): %s",
+                 dur, rec["base"].name)
 
     def discard_recording(self):
-        state, _names = self._detach_recording()
-        temp = state["temp"]
-        for _ in range(20):
-            try:
-                temp.unlink(missing_ok=True)
-                break
-            except PermissionError:
-                time.sleep(0.25)
-        else:
-            raise RuntimeError(f"could not delete {temp.name}")
-        dur = max(0.0, state["last"] - state["started"])
+        rec, dur = self.detach_recording()
+        paths = [s["path"] for s in rec["segments"]] + [rec["meta_path"]]
+        for p in paths:
+            for _ in range(20):
+                try:
+                    p.unlink(missing_ok=True)
+                    break
+                except PermissionError:
+                    time.sleep(0.25)
+            else:
+                raise RuntimeError(f"could not delete {p.name}")
+        _dur, size = self._rec_totals(rec)
         log.info("continuous recording discarded: %s (%.0f s, %.1f MB)",
-                 temp.name, dur, state["bytes"] / 1e6)
+                 rec["base"].name, dur, size / 1e6)
         return dur
 
-    def stop_recording(self, on_stopped=None):
-        state, names = self._detach_recording()
-        if state["error"]:
-            log.warning("finalizing interrupted recording: %s", state["error"])
-        if state["bytes"] <= 0:
-            state["temp"].unlink(missing_ok=True)
-            raise RuntimeError("recording contains no video")
-        if on_stopped:
-            on_stopped(max(0.0, state["last"] - state["started"]))
+    def finalize_recording(self, rec):
+        return self._finalize(rec["meta"], rec["meta_path"])
 
+    def stop_recording(self, on_stopped=None):
+        rec, dur = self.detach_recording()
+        if on_stopped:
+            on_stopped(dur)
+        return self.finalize_recording(rec)
+
+    def _finalize(self, meta, meta_path, recovered=False):
+        segs = [s for s in meta["segments"]
+                if Path(s["path"]).exists() and Path(s["path"]).stat().st_size > 0]
+        if not segs:
+            meta_path.unlink(missing_ok=True)
+            raise RuntimeError("recording contains no video")
+        groups = []
+        for s in segs:
+            key = None if s["layout"] is None else [l for l, _t in s["layout"]]
+            if groups and groups[-1][0] == key:
+                groups[-1][1].append(s)
+            else:
+                groups.append((key, [s]))
+        base_out = Path(meta["out"])
+        outs = []
+        size = 0
+        for gi, (_key, group) in enumerate(groups):
+            out = base_out
+            if gi:
+                out = out.with_name(f"{out.stem}_part{gi + 1}{out.suffix}")
+            if recovered:
+                out = out.with_name(f"{out.stem}_recovered{out.suffix}")
+            out = _free_name(out)
+            maps, mdata, kept = self._recording_maps(group)
+            files = [Path(s["path"]) for s in group]
+            listing = None
+            if len(files) == 1:
+                inp = ["-fflags", "+genpts", "-f", "mpegts", "-i", str(files[0])]
+            else:
+                listing = meta_path.with_name(f"{meta_path.stem}.{gi + 1}.txt")
+                _concat_list(listing, files)
+                inp = ["-f", "concat", "-safe", "0", "-i", str(listing)]
+            with open(self.err_log, "ab") as errf:
+                rc = subprocess.run(
+                    [self.ffmpeg, "-y", "-hide_banner", "-loglevel", "error"]
+                    + inp + maps + ["-c", "copy"] + mdata
+                    + ["-movflags", "+faststart", str(out)],
+                    stdout=subprocess.DEVNULL, stderr=errf,
+                    creationflags=CREATE_NO_WINDOW).returncode
+            if listing:
+                listing.unlink(missing_ok=True)
+            if rc != 0 or not out.exists() or out.stat().st_size == 0:
+                out.unlink(missing_ok=True)
+                raise RuntimeError(
+                    f"recording remux failed rc={rc}; source kept at {files[0]}")
+            outs.append(out)
+            size += out.stat().st_size
+            log.info("continuous recording saved %s from %s segment(s),"
+                     " tracks=%s", out.name, len(files),
+                     "all" if _key is None else (kept or "none"))
+        for s in segs:
+            Path(s["path"]).unlink(missing_ok=True)
+        meta_path.unlink(missing_ok=True)
+        dur = sum(s.get("dur", 0.0) for s in segs)
+        if len(outs) > 1:
+            log.warning("track layout changed mid-recording: saved %s files",
+                        len(outs))
+        return outs[0], dur, size
+
+    @staticmethod
+    def _recording_maps(group):
+        layout = group[0]["layout"]
+        if layout is None:
+            return ["-map", "0"], [], []
+        active = set()
+        for s in group:
+            active.update(s["active"])
         maps = ["-map", "0:v:0"]
-        meta = []
+        mdata = []
         kept = []
         out_a = 0
-        for i, (label, title) in enumerate(state["layout"]):
-            if label not in state["active"]:
+        for i, (label, title) in enumerate(layout):
+            if label not in active:
                 continue
-            title = names.get(label, title)
+            for s in group:
+                if s["names"].get(label):
+                    title = s["names"][label]
+                    break
             maps += ["-map", f"0:a:{i}?"]
-            meta += [f"-metadata:s:a:{out_a}", f"handler_name={title}",
-                     f"-metadata:s:a:{out_a}", f"title={title}"]
+            mdata += [f"-metadata:s:a:{out_a}", f"handler_name={title}",
+                      f"-metadata:s:a:{out_a}", f"title={title}"]
             kept.append(title)
             out_a += 1
-        out = state["out"]
-        with open(self.err_log, "ab") as errf:
-            rc = subprocess.run(
-                [self.ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
-                 "-fflags", "+genpts", "-f", "mpegts", "-i", str(state["temp"])]
-                + maps + ["-c", "copy"] + meta
-                + ["-movflags", "+faststart", str(out)],
-                stdout=subprocess.DEVNULL, stderr=errf,
-                creationflags=CREATE_NO_WINDOW).returncode
-        if rc != 0 or not out.exists() or out.stat().st_size == 0:
-            raise RuntimeError(
-                f"recording remux failed rc={rc}; source kept at {state['temp']}")
-        state["temp"].unlink(missing_ok=True)
-        size = out.stat().st_size
-        dur = max(0.0, state["last"] - state["started"])
-        log.info("continuous recording saved %s (%.0f s, %.1f MB), tracks=%s",
-                 out.name, dur, size / 1e6, kept or "none")
-        return out, dur, size
+        return maps, mdata, kept
+
+    def recover(self, folder):
+        folder = Path(folder)
+        results = []
+        if not folder.is_dir():
+            return results
+        pid = os.getpid()
+
+        def mine(name):
+            return f"_{pid}." in name or f"_{pid}_" in name
+
+        claimed = set()
+        for mp in sorted(folder.glob(".recording_*.json")):
+            try:
+                meta = json.loads(mp.read_text("utf-8"))
+            except (OSError, ValueError):
+                continue
+            for s in meta.get("segments", []):
+                claimed.add(Path(s["path"]).name.lower())
+            if mp.name.endswith(".failed.json") or mine(mp.name):
+                continue
+            results.append(self._recover_one(meta, mp))
+        orphans = {}
+        for ts in sorted(folder.glob(".recording_*.ts")):
+            if ts.name.lower() in claimed or mine(ts.name):
+                continue
+            orphans.setdefault(ts.name.split(".")[1], []).append(ts)
+        for key, files in orphans.items():
+            files.sort(key=lambda p: (len(p.name), p.name))
+            stem = key.rsplit("_", 1)[0] if key.count("_") >= 3 else key
+            meta = {"out": str(folder / f"{stem.lstrip('.')}.mp4"),
+                    "segments": [{"path": str(f), "layout": None, "names": {},
+                                  "active": [], "dur": 0.0} for f in files]}
+            results.append(self._recover_one(meta, folder / f".{key}.json"))
+        return results
+
+    def _recover_one(self, meta, meta_path):
+        try:
+            out, _dur, size = self._finalize(meta, meta_path, recovered=True)
+            log.info("recovered recording %s (%.1f MB)", out.name, size / 1e6)
+            return True, out.name
+        except Exception as e:
+            log.error("recording recovery failed for %s: %s", meta_path.name, e)
+            try:
+                if meta_path.exists():
+                    meta_path.replace(meta_path.with_name(
+                        meta_path.stem + ".failed.json"))
+                else:
+                    _write_json(meta_path.with_name(
+                        meta_path.stem + ".failed.json"), meta)
+            except OSError:
+                pass
+            return False, str(e)
 
     def buffered(self):
         with self.lock:

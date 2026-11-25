@@ -29,6 +29,8 @@ class App:
         self.record_busy = threading.Lock()
         self.ticks = 0
         self._toasts = collections.deque()
+        self._finalizers = set()
+        self._quitting = False
         self.tray = winutil.Tray(self._tip(), common.ICON_ACTIVE, self.handle)
         try:
             self.toast = winutil.Toast()
@@ -43,11 +45,24 @@ class App:
         self._register_hotkeys()
         self.recorder.start()
         self.tray.start_timer(60000)
+        threading.Thread(target=self._recover_job, daemon=True).start()
+
+    def _recover_job(self):
+        try:
+            results = self.recorder.recover(self.cfg["folder"])
+        except Exception:
+            log.exception("recording recovery failed")
+            return
+        for ok, text in results:
+            if ok:
+                self._notify("Recording recovered", text, True)
+            else:
+                self._notify("Recovery failed", text[:80], False)
 
     def _tip(self):
         active, dur, _size = self.recorder.recording_status()
         if active:
-            return f"Povtoritel: recording {int(dur)}s"
+            return f"Povtoritel: recording {_dur_text(dur)}"
         if self.recorder.paused:
             return "Povtoritel: paused"
         secs, size = self.recorder.buffered()
@@ -107,12 +122,18 @@ class App:
                 log.warning("capture stalled, restarting")
                 self.recorder.restart()
             self._update_tray()
+            self.recorder.checkpoint()
+            self.tray.refresh_hook()
             self.ticks += 1
             if self.ticks % 5 == 0:
                 secs, size = self.recorder.buffered()
                 log.info("buffer: %.0fs, %.1f MB", secs, size / 1e6)
         elif kind == "quit":
             self.quit()
+        elif kind == "quit_done":
+            self.tray.destroy()
+        elif kind == "endsession":
+            self._end_session()
 
     def menu(self):
         paused = self.recorder.paused
@@ -195,12 +216,12 @@ class App:
         threading.Thread(target=self._record_job, daemon=True).start()
 
     def _record_job(self):
+        rec = None
         try:
             if self.recorder.recording():
-                out, dur, size = self.recorder.stop_recording(
-                    on_stopped=self._recording_stopped)
-                self._notify("Recording saved",
-                             f"{_dur_text(dur)}  -  {_size_text(size)}", True)
+                rec, dur = self.recorder.detach_recording()
+                self._notify("Recording stopped",
+                             f"{_dur_text(dur)}, writing file...", True)
             else:
                 self.recorder.start_recording(self.cfg["folder"])
                 self._notify("Recording started", "Press the hotkey again to stop", True)
@@ -210,11 +231,21 @@ class App:
         finally:
             self.record_busy.release()
             self._update_tray()
+        if rec is not None:
+            self._finalize(rec)
 
-    def _recording_stopped(self, dur):
-        self._notify("Recording stopped", f"{_dur_text(dur)}, writing file...",
-                     True)
-        self._update_tray()
+    def _finalize(self, rec):
+        me = threading.current_thread()
+        self._finalizers.add(me)
+        try:
+            out, dur, size = self.recorder.finalize_recording(rec)
+            self._notify("Recording saved",
+                         f"{_dur_text(dur)}  -  {_size_text(size)}", True)
+        except Exception as e:
+            log.exception("recording finalization failed")
+            self._notify("Recording save failed", str(e)[:80], False)
+        finally:
+            self._finalizers.discard(me)
 
     def discard_recording(self):
         if not self.recorder.recording():
@@ -242,7 +273,6 @@ class App:
             self.record_busy.release()
             self._update_tray()
 
-
     def _notify(self, title, body, ok, fallback=True, hold=1800):
         if self.toast and (fallback or self.toast.excluded):
             try:
@@ -268,9 +298,9 @@ class App:
         self.cfg = common.load_cfg()
         self.recorder.configure(self.cfg)
         if self._register_hotkeys():
-            self.tray.balloon("Settings applied",
-                              f"{self.cfg['minutes']} min buffer,"
-                              f" save with {self.cfg['hotkey']['label']}")
+            self._notify("Settings applied",
+                         f"{self.cfg['minutes']} min buffer,"
+                         f" save with {self.cfg['hotkey']['label']}", True)
         self._update_tray()
 
     def _register_hotkeys(self):
@@ -278,31 +308,46 @@ class App:
             self.cfg["hotkey"], self.cfg["record_hotkey"],
             self.cfg.get("hold_for_recording", False))
         if not ok:
-            self.tray.balloon("Hotkeys unavailable",
-                              "Global keyboard hook failed. Restart Povtoritel.")
+            self._notify("Hotkeys unavailable",
+                         "Keyboard hook failed, restart Povtoritel", False)
         return ok
 
     def _capture_failing(self, fails):
         if fails >= 8:
-            self.tray.balloon("Capture failing",
-                              "Screen capture keeps failing; retrying every"
-                              " minute. It resumes by itself once the screen"
-                              " is available (see ffmpeg.log).")
+            self._notify("Capture failing",
+                         "Retrying every minute, see ffmpeg.log", False)
         else:
-            self.tray.balloon("Capture failing",
-                              "Screen capture keeps failing. If this persists,"
-                              " re-pick the screen in Settings"
-                              " (see ffmpeg.log).")
+            self._notify("Capture failing",
+                         "Re-pick the screen in Settings if it persists", False)
 
     def quit(self):
+        if self._quitting:
+            return
+        self._quitting = True
+        if self.recorder.recording() or self._finalizers:
+            self._notify("Finishing recording",
+                         "Povtoritel exits when the file is written", True)
+        threading.Thread(target=self._quit_job, daemon=True).start()
+
+    def _quit_job(self):
         with self.busy, self.record_busy:
             if self.recorder.recording():
                 try:
                     self.recorder.stop_recording()
                 except Exception:
                     log.exception("recording finalization on quit failed")
+            for th in list(self._finalizers):
+                th.join()
             self.recorder.stop()
-            self.tray.destroy()
+        winutil.user32.PostMessageW(self.tray.hwnd, winutil.MSG_QUIT_DONE, 0, 0)
+
+    def _end_session(self):
+        log.info("windows session ending")
+        try:
+            self.recorder.shutdown_recording()
+        except Exception:
+            log.exception("recording shutdown failed")
+        self.recorder.stop(timeout=1)
 
 
 def _dur_text(sec):
@@ -315,7 +360,6 @@ def _dur_text(sec):
 
 def _size_text(size):
     return f"{size / 1e9:.2f} GB" if size >= 1e9 else f"{size / 1e6:.0f} MB"
-
 
 
 def run_app():

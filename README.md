@@ -22,7 +22,7 @@ powershell -ExecutionPolicy Bypass -File setup.ps1
 .\Povtoritel.exe
 ```
 
-The setup script downloads FFmpeg and, when Visual Studio C++ Build Tools are
+The setup script downloads FFmpeg 8.1.2 (checksum verified) and, when Visual Studio C++ Build Tools are
 installed, builds `Povtoritel.exe`: a small launcher that runs the application
 in-process with its own name and icon, so Task Manager shows "Povtoritel"
 instead of Python. Rebuild it with `launcher\build.ps1` after changing the
@@ -43,6 +43,14 @@ creates its configuration, tray icons, and autostart entry.
   deletes its temporary file.
 - Stopping a recording or saving a replay shows a notification at once; a
   second notification with the file size follows when the file is written.
+  A new recording can be started while the previous file is still being
+  written.
+- A recording survives capture restarts: it continues in a new segment and
+  the segments are joined into one MP4 when it stops.
+- If Windows shuts down or the application is killed during a recording, the
+  recorded part is saved as `recording_..._recovered.mp4` on the next start.
+- Quitting during a recording finishes the file before the application exits.
+- Tray icon: click or right-click opens the menu, double-click opens Settings.
 - Additional held Shift, Ctrl, or Alt keys do not prevent a configured hotkey
   from working. If replay and recording combinations overlap, recording takes
   priority and only one action is performed.
@@ -56,7 +64,8 @@ The tray icon indicates the current state:
 - Red: continuous recording is active.
 
 Recordings are saved to the folder selected in Settings. Notifications are
-displayed on the captured screen and are excluded from the recording.
+displayed on the captured screen and are excluded from the recording; a
+standard tray balloon is used only if the notification window fails.
 
 ## Commands
 
@@ -64,16 +73,27 @@ displayed on the captured screen and are excluded from the recording.
 .\Povtoritel.exe
 py povtoritel.pyw --settings
 py povtoritel.pyw --save
+py povtoritel.pyw --reload
 py povtoritel.pyw --quit
 py povtoritel.pyw --check
 ```
+
+Launching the application while it is already running opens Settings.
 
 ## Notes
 
 - One screen is recorded at a time.
 - Desktop audio is saved as a Full track (desktop + microphone). Microphone
   and automatic per-application tracks remain separate and configurable.
+- Per-application tracks use 6 slots (`app_slots`). When all slots are taken
+  and another application plays sound, the slot that has been silent longer
+  than the buffer is reassigned (never during a long recording). Sound that
+  gets no slot stays in the Full/Desktop track.
+- "Ignore apps" in Settings (`app_exclude`) lists executables that never get
+  their own track; `picomicdrainer.exe` is ignored by default.
 - The RAM buffer is cleared when capture restarts.
+- `povtoritel.log` rotates at 1 MB and `ffmpeg.log` at 2 MB (one `.old` copy
+  each).
 - Screen lock and display sleep temporarily suspend capture. Recovery is
   automatic when the desktop becomes available.
 - `mpo_disable.reg` can improve capture stability under high GPU load. A sign

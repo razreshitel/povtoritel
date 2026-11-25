@@ -8,13 +8,20 @@ if (Test-Path $exe) {
     Write-Host "ffmpeg already present: $exe"
 } else {
     New-Item -ItemType Directory -Force $bin | Out-Null
-    $url = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
+    $ver = "8.1.2"
+    $url = "https://github.com/GyanD/codexffmpeg/releases/download/$ver/ffmpeg-$ver-essentials_build.zip"
+    $sha = "db580001caa24ac104c8cb856cd113a87b0a443f7bdf47d8c12b1d740584a2ec"
     $zip = Join-Path $env:TEMP "ffmpeg-povtoritel.zip"
     $dir = Join-Path $env:TEMP "ffmpeg-povtoritel"
 
-    Write-Host "Downloading static ffmpeg (about 100 MB)..."
+    Write-Host "Downloading static ffmpeg $ver (about 100 MB)..."
     $ProgressPreference = "SilentlyContinue"
     Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing
+    $got = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+    if ($got -ne $sha) {
+        Remove-Item $zip -Force
+        throw "ffmpeg download checksum mismatch: $got"
+    }
 
     Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue
     Expand-Archive $zip -DestinationPath $dir -Force

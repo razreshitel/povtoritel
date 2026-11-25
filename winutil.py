@@ -33,6 +33,10 @@ MSG_SETTINGS = WM_APP + 4
 MSG_TOAST = WM_APP + 5
 MSG_HOTKEY_ACTION = WM_APP + 6
 MSG_INDICATOR = WM_APP + 7
+MSG_QUIT_DONE = WM_APP + 8
+WM_QUERYENDSESSION = 0x0011
+WM_ENDSESSION = 0x0016
+CLICK_TIMER = 1002
 MSG_TRAY = WM_APP + 10
 WM_PAINT = 0x000F
 
@@ -425,6 +429,7 @@ class Tray:
         self._hold_vk = None
         self._hold_fired = False
         self._hotkeys = {}
+        self._dbl = False
 
     def _add_icon(self):
         import time
@@ -492,6 +497,16 @@ class Tray:
         log.info("global keyboard hook installed")
         return True
 
+    def refresh_hook(self):
+        # Windows drops slow hooks
+        if not self._hook:
+            return
+        new = user32.SetWindowsHookExW(
+            WH_KEYBOARD_LL, self._hook_proc, kernel32.GetModuleHandleW(None), 0)
+        if new:
+            user32.UnhookWindowsHookEx(self._hook)
+            self._hook = new
+
     def _mods_down(self):
         keys = {"shift": 0x10, "ctrl": 0x11, "alt": 0x12}
         return {name for name, vk in keys.items()
@@ -521,7 +536,8 @@ class Tray:
             self._hold_fired = False
             user32.SetTimer(self.hwnd, HOTKEY_HOLD_TIMER, HOTKEY_HOLD_MS, None)
             return
-        if self._matches(self._hotkeys["record"], vk, down):
+        if (not self._hold_for_recording
+                and self._matches(self._hotkeys["record"], vk, down)):
             self._emit_hotkey("record")
         elif self._matches(self._hotkeys["save"], vk, down):
             self._emit_hotkey("save")
@@ -557,10 +573,29 @@ class Tray:
                 return 0
             if msg == MSG_TRAY:
                 ev = lp & 0xFFFF
-                if ev in (WM_LBUTTONUP, WM_RBUTTONUP):
+                if ev == WM_LBUTTONUP:
+                    if self._dbl:
+                        self._dbl = False
+                    else:
+                        # wait for double click
+                        user32.SetTimer(hwnd, CLICK_TIMER,
+                                        user32.GetDoubleClickTime(), None)
+                elif ev == WM_RBUTTONUP:
+                    user32.KillTimer(hwnd, CLICK_TIMER)
                     self.handler("menu", None)
                 elif ev == WM_LBUTTONDBLCLK:
+                    user32.KillTimer(hwnd, CLICK_TIMER)
+                    self._dbl = True
                     self.handler("settings", None)
+                return 0
+            if msg == WM_QUERYENDSESSION:
+                return 1
+            if msg == WM_ENDSESSION:
+                if wp:
+                    self.handler("endsession", None)
+                return 0
+            if msg == MSG_QUIT_DONE:
+                self.handler("quit_done", None)
                 return 0
             if msg == MSG_RELOAD:
                 self.handler("reload", None)
@@ -580,6 +615,10 @@ class Tray:
                     if self._hold_vk in self._pressed:
                         self._hold_fired = True
                         self._emit_hotkey("record")
+                    return 0
+                if wp == CLICK_TIMER:
+                    user32.KillTimer(hwnd, CLICK_TIMER)
+                    self.handler("menu", None)
                     return 0
                 self.handler("timer", None)
                 return 0

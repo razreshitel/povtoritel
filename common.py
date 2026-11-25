@@ -16,9 +16,7 @@ ICON_ACTIVE = BASE / "icon_active.ico"
 ICON_REC = BASE / "icon_rec.ico"
 ICON_PAUSE = BASE / "icon_pause.ico"
 APP_NAME = "Povtoritel"
-
-OVERWOLF_DIR = (Path.home() / "AppData" / "Local" / "Overwolf" / "Extensions"
-                / "ncfplpkmiejjaklknfnkgcpapnhkggmlcppckhcb")
+log = logging.getLogger("povtoritel")
 
 DEFAULTS = {
     "screen": {"adapter": 0, "output": 0, "vendor": "0x10de"},
@@ -35,26 +33,51 @@ DEFAULTS = {
     "mic_device": "",
     "app_auto": True,
     "app_slots": 6,
+    "app_exclude": ["picomicdrainer.exe"],
     "audio_offset_ms": 0,
     "capture_priority": False,
     "autostart": True,
 }
 
 
+def _valid(default, value):
+    if isinstance(default, bool):
+        return isinstance(value, bool)
+    if isinstance(default, int):
+        return isinstance(value, int) and not isinstance(value, bool)
+    if isinstance(default, str):
+        return isinstance(value, str)
+    if isinstance(default, list):
+        return isinstance(value, list) and all(isinstance(x, str) for x in value)
+    if isinstance(default, dict):
+        return isinstance(value, dict) and all(
+            k in value and _valid(v, value[k]) for k, v in default.items())
+    return True
+
+
 def load_cfg():
     cfg = json.loads(json.dumps(DEFAULTS))
     try:
         data = json.loads(CONFIG_PATH.read_text("utf-8"))
-        for k, v in data.items():
-            if k in cfg:
-                cfg[k] = v
-    except (OSError, ValueError):
-        pass
+    except FileNotFoundError:
+        return cfg
+    except (OSError, ValueError) as e:
+        log.warning("config unreadable, using defaults: %s", e)
+        return cfg
+    for k, v in data.items():
+        if k not in cfg:
+            continue
+        if _valid(DEFAULTS[k], v) and not (k == "fps" and v <= 0):
+            cfg[k] = v
+        else:
+            log.warning("config %s=%r invalid, using default", k, v)
     return cfg
 
 
 def save_cfg(cfg):
-    CONFIG_PATH.write_text(json.dumps(cfg, indent=1), "utf-8")
+    tmp = CONFIG_PATH.with_name(CONFIG_PATH.name + ".tmp")
+    tmp.write_text(json.dumps(cfg, indent=1), "utf-8")
+    os.replace(tmp, CONFIG_PATH)
 
 
 def pythonw():
@@ -81,10 +104,7 @@ def startup_cmd():
 
 def find_ffmpeg():
     local = BIN_DIR / "ffmpeg.exe"
-    if local.exists():
-        return local
-    found = sorted(OVERWOLF_DIR.glob("*/obs/bin/64bit/ffmpeg.exe"), reverse=True)
-    return found[0] if found else None
+    return local if local.exists() else None
 
 
 def ffmpeg_works(path):
