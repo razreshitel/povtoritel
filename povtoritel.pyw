@@ -17,6 +17,7 @@ log = logging.getLogger("povtoritel")
 (MENU_SAVE, MENU_RECORD, MENU_PAUSE, MENU_FOLDER, MENU_SETTINGS,
  MENU_AUTOSTART, MENU_QUIT, MENU_DISCARD) = range(1, 9)
 INDICATOR_EXCLUDED = True
+RECORD_LIMIT_S = 10 * 3600
 
 
 class App:
@@ -31,6 +32,7 @@ class App:
         self._toasts = collections.deque()
         self._finalizers = set()
         self._quitting = False
+        self._rec_gen = 0
         self.tray = winutil.Tray(self._tip(), common.ICON_ACTIVE, self.handle)
         try:
             self.toast = winutil.Toast()
@@ -215,15 +217,35 @@ class App:
             return
         threading.Thread(target=self._record_job, daemon=True).start()
 
-    def _record_job(self):
+    def _limit_hit(self, gen):
+        if gen != self._rec_gen or not self.recorder.recording():
+            return
+        if not self.record_busy.acquire(blocking=False):
+            t = threading.Timer(1, self._limit_hit, args=(gen,))
+            t.daemon = True
+            t.start()
+            return
+        log.info("recording limit reached")
+        threading.Thread(target=self._record_job, args=(gen,), daemon=True).start()
+
+    def _record_job(self, gen=None):
         rec = None
         try:
+            if gen is not None and gen != self._rec_gen:
+                return
             if self.recorder.recording():
                 rec, dur = self.recorder.detach_recording()
+                self._rec_gen += 1
+                note = ", limit reached" if gen is not None else ""
                 self._notify("Recording stopped",
-                             f"{_dur_text(dur)}, writing file...", True)
-            else:
+                             f"{_dur_text(dur)}{note}, writing file...", True)
+            elif gen is None:
                 self.recorder.start_recording(self.cfg["folder"])
+                self._rec_gen += 1
+                t = threading.Timer(RECORD_LIMIT_S, self._limit_hit,
+                                    args=(self._rec_gen,))
+                t.daemon = True
+                t.start()
                 self._notify("Recording started", "Press the hotkey again to stop", True)
         except Exception as e:
             log.exception("continuous recording failed")

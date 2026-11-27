@@ -33,10 +33,11 @@ creates its configuration, tray icons, and autostart entry.
 ## Usage
 
 - The replay hotkey saves the configured number of recent minutes.
-- The recording hotkey starts or stops continuous recording.
+- The recording hotkey starts or stops continuous recording. A recording
+  stops and is saved automatically after 10 hours.
 - Continuous recording can instead use a two-second hold of the replay hotkey.
-- During continuous recording, a small red corner mark (4x4 px L shape,
-  2 px thick) stays in the top-right corner of the captured screen. It is
+- During continuous recording, a small red corner mark (8x8 px L shape,
+  4 px thick) stays in the top-right corner of the captured screen. It is
   excluded from the recording and from screen sharing.
 - While continuous recording is active, the tray menu offers "Delete
   recording without saving": after confirmation it stops the recording and

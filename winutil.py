@@ -706,7 +706,7 @@ INDICATOR_CLASS = "PovtoritelIndicator"
 class Indicator:
     """Red corner pixels."""
 
-    def __init__(self, arm=4, thick=2, excluded=True):
+    def __init__(self, arm=8, thick=4, excluded=True):
         self.W = self.H = arm
         self.visible = False
         hinst = kernel32.GetModuleHandleW(None)
